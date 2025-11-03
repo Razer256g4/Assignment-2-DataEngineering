@@ -41,12 +41,13 @@ class AppState:
     connected: bool = False
     client: Optional[Any] = None
     topic: str = ""
+    price_demand: dict = field(default_factory=dict)
 
 
 @st.cache_resource(show_spinner=False)
 def get_state() -> AppState:
     state = AppState()
-    lk = pd.read_csv("../comp5339_a2/notebooks/fac.csv")
+    lk = pd.read_csv("fac.csv")
     lk['fuel_tech'] = lk['fuel_tech'].apply(json.loads)
     state.facility_lookup = lk.set_index("facility_id")
     return state
@@ -118,38 +119,44 @@ def _on_message(client, userdata: AppState, msg):
     except Exception:
         return
 
-    d = _normalize_payload(payload)
-    print(d)
+    if payload.get("price_dmwh"):
+        with userdata.lock:
+            userdata.price_demand = payload
+            print("Price Demand Updated")
 
-    # Enrich with lookup if lat/lon missing
-    if userdata.facility_lookup is not None:
+    elif payload.get("facility_id"):
+        d = _normalize_payload(payload) 
+        # print(d)
+
+        # Enrich with lookup if lat/lon missing
+        if userdata.facility_lookup is not None:
+            fid = d.get("facility_id")
+            if fid and (pd.isna(d.get("lat")) or pd.isna(d.get("lon")) or d.get("lat") is None or d.get("lon") is None):
+                try:
+                    row = userdata.facility_lookup.loc[fid]
+                    # print(row)
+                    d.setdefault("facility_name", row.get("facility_name"))
+                    d.setdefault("region", row.get("region"))
+                    d.setdefault("fuel_tech", row.get("fuel_tech"))
+                    d.setdefault("lat", float(row.get("lat")))
+                    d.setdefault("lon", float(row.get("lon")))
+                except Exception as e:
+                    print("Exception encountered: ", e)
+                    pass
+
         fid = d.get("facility_id")
-        if fid and (pd.isna(d.get("lat")) or pd.isna(d.get("lon")) or d.get("lat") is None or d.get("lon") is None):
-            try:
-                row = userdata.facility_lookup.loc[fid]
-                print(row)
-                d.setdefault("facility_name", row.get("facility_name"))
-                d.setdefault("region", row.get("region"))
-                d.setdefault("fuel_tech", row.get("fuel_tech"))
-                d.setdefault("lat", float(row.get("lat")))
-                d.setdefault("lon", float(row.get("lon")))
-            except Exception as e:
-                print("Exception encountered: ", e)
-                pass
+        if not fid:
+            return
 
-    fid = d.get("facility_id")
-    if not fid:
-        return
+        with userdata.lock:
+            # Keep latest per facility
+            d.pop('facility_id', None)
+            prev = userdata.latest_by_facility.get(fid, {})
+            userdata.latest_by_facility[fid] = {**prev, **d}
+            # Append to short history for optional charts/debug
+            userdata.history.append({**d, "_ts": time.time()})
 
-    with userdata.lock:
-        # Keep latest per facility
-        d.pop('facility_id', None)
-        prev = userdata.latest_by_facility.get(fid, {})
-        userdata.latest_by_facility[fid] = {**prev, **d}
-        # Append to short history for optional charts/debug
-        userdata.history.append({**d, "_ts": time.time()})
-
-    print("Check latest_by_facility: ", len(userdata.latest_by_facility))
+        print("Check latest_by_facility: ", len(userdata.latest_by_facility))
 
 @st.cache_resource(show_spinner=False)
 def start_mqtt_client(broker: str, port: int, topic: str, username: str | None, password: str | None) -> AppState:
@@ -372,9 +379,9 @@ with sub:
     regions = sorted([r for r in df["region"].dropna().unique()]) if not df.empty else []
     # fuels = sorted([f for f in df["fuel_tech"].dropna().unique()]) if not df.empty else []
     fuels: list = sorted(set(f for sublist in df["fuel_tech"] for f in sublist)) if not df.empty else []
-    print(df['fuel_tech'].head())
+    # print(df['fuel_tech'].head())
 
-    c1, c2, c3 = st.columns([2, 2, 3])
+    c1, c2, c3, c4 = st.columns([2, 2, 3, 3])
     with c1:
         sel_regions = st.multiselect("Region", options=regions, default=regions)
     with c2:
@@ -388,11 +395,15 @@ with sub:
             fdf = fdf[fdf["fuel_tech"].isin(sel_fuels)]
         total_power = float(fdf["power_mw"].fillna(0).sum()) if not fdf.empty else 0.0
         total_co2 = float(fdf["co2_tonnes"].fillna(0).sum()) if not fdf.empty else 0.0
-        m1, m2, m3, m4 = st.columns(4)
+        m1, m2= st.columns(2)
         m1.metric("Total Power (MW)", f"{total_power:,.1f}")
         m2.metric("Total CO₂ (t)", f"{total_co2:,.1f}")
-        m3.metric("Total Power (MW)", f"{total_power:,.1f}")
-        m4.metric("Total CO₂ (t)", f"{total_co2:,.1f}")
+    with c4:
+        
+        st.caption(f"NEM Market:  {state.price_demand.get('timestamp', 'pending data...')}")
+        m3, m4 = st.columns(2)
+        m3.metric("Price ($/MWh)", f"{state.price_demand.get('price_dmwh', 0):,.1f}")
+        m4.metric("Demand (MW)", f"{state.price_demand.get('demand_mw', 0):,.1f}")
 
     # Apply filters for map render
     if not df.empty:
