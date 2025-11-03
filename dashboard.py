@@ -45,7 +45,11 @@ class AppState:
 
 @st.cache_resource(show_spinner=False)
 def get_state() -> AppState:
-    return AppState()
+    state = AppState()
+    lk = pd.read_csv("../comp5339_a2/notebooks/fac.csv")
+    lk['fuel_tech'] = lk['fuel_tech'].apply(json.loads)
+    state.facility_lookup = lk.set_index("facility_id")
+    return state
 
 
 # ----------------------------
@@ -60,7 +64,7 @@ def _normalize_payload(msg: Dict[str, Any]) -> Dict[str, Any]:
     - facility_name (str)
     - lat (float), lon (float)
     - region (str) e.g., QLD, NSW, VIC, SA, TAS
-    - fuel_tech (str) e.g., Coal, Gas, Hydro, Wind, Solar, Battery
+    - fuel_tech (list[str]) e.g., Coal, Gas, Hydro, Wind, Solar, Battery
     - timestamp (ISO8601 string)
     - power_mw (float)
     - co2_tonnes (float)
@@ -115,6 +119,7 @@ def _on_message(client, userdata: AppState, msg):
         return
 
     d = _normalize_payload(payload)
+    print(d)
 
     # Enrich with lookup if lat/lon missing
     if userdata.facility_lookup is not None:
@@ -122,12 +127,14 @@ def _on_message(client, userdata: AppState, msg):
         if fid and (pd.isna(d.get("lat")) or pd.isna(d.get("lon")) or d.get("lat") is None or d.get("lon") is None):
             try:
                 row = userdata.facility_lookup.loc[fid]
+                print(row)
                 d.setdefault("facility_name", row.get("facility_name"))
                 d.setdefault("region", row.get("region"))
                 d.setdefault("fuel_tech", row.get("fuel_tech"))
                 d.setdefault("lat", float(row.get("lat")))
                 d.setdefault("lon", float(row.get("lon")))
-            except Exception:
+            except Exception as e:
+                print("Exception encountered: ", e)
                 pass
 
     fid = d.get("facility_id")
@@ -136,11 +143,13 @@ def _on_message(client, userdata: AppState, msg):
 
     with userdata.lock:
         # Keep latest per facility
+        d.pop('facility_id', None)
         prev = userdata.latest_by_facility.get(fid, {})
         userdata.latest_by_facility[fid] = {**prev, **d}
         # Append to short history for optional charts/debug
         userdata.history.append({**d, "_ts": time.time()})
 
+    print("Check latest_by_facility: ", len(userdata.latest_by_facility))
 
 @st.cache_resource(show_spinner=False)
 def start_mqtt_client(broker: str, port: int, topic: str, username: str | None, password: str | None) -> AppState:
@@ -228,11 +237,11 @@ FUEL_COLORS = {
 
 def make_map(df: pd.DataFrame, metric: str) -> folium.Map:
     # Fallback center: Australia
-    center = (-25.0, 133.0)
+    center = (-35.0, 147.0)
     if not df.empty:
         center = (float(df["lat"].mean()), float(df["lon"].mean()))
 
-    fmap = folium.Map(location=center, zoom_start=4, tiles="cartodbpositron")
+    fmap = folium.Map(location=center, zoom_start=6, tiles="cartodbpositron")
 
     if df.empty:
         return fmap
@@ -245,7 +254,8 @@ def make_map(df: pd.DataFrame, metric: str) -> folium.Map:
         val = float(r.get(metric, 0.0) or 0.0)
         radius = 4.0 + 10.0 * np.sqrt(min(val / ref, 1.0))
 
-        fuel = (r.get("fuel_tech") or "").strip()
+        # fuel = (r.get("fuel_tech") or "").strip()
+        fuel = (r.get("fuel_tech")[0] or "").strip()
         color = FUEL_COLORS.get(fuel, "#64748b")
 
         name = r.get("facility_name") or r.get("facility_id")
@@ -263,6 +273,27 @@ def make_map(df: pd.DataFrame, metric: str) -> folium.Map:
           <div style='font-size:12px;color:#64748b;margin-top:6px'>Latest at: {ts}</div>
         </div>
         """
+
+        label = f"{name}<br>{val}{'MW' if metric == 'power_mw' else 't'}"
+        if show_labels:
+            folium.Marker(
+                location=(float(r["lat"]), float(r["lon"])),
+                icon=folium.DivIcon(html=f"""
+                    <div style="
+                        display: inline-block;
+                        font-size:14px;
+                        color:{color};
+                        background:white;
+                        border-radius:4px;
+                        padding:4px 8px;
+                        white-space:nowrap;
+                        box-shadow:0 1px 4px #0002
+                        margin-bottom: 28px; 
+                        text-align:center;
+                        transform:translate(-100%, -100%);
+                        position:relative;
+                    ">{label}</div>""")
+            ).add_to(fmap)
 
         folium.CircleMarker(
             location=(float(r["lat"]), float(r["lon"])),
@@ -283,7 +314,7 @@ def make_map(df: pd.DataFrame, metric: str) -> folium.Map:
 # ----------------------------
 with st.sidebar:
     st.markdown("### Connection")
-    broker = st.text_input("MQTT broker", value="localhost")
+    broker = st.text_input("MQTT broker", value="test.mosquitto.org")
     port = st.number_input("Port", value=1883, min_value=1, max_value=65535, step=1)
     topic = st.text_input("Topic", value="nem/power_emissions")
 
@@ -293,9 +324,10 @@ with st.sidebar:
     with col_b:
         password = st.text_input("Password", value="", type="password", placeholder="optional")
 
-    connect = st.button("Connect / Reconnect", use_container_width=True)
+    connect = st.button("Connect / Reconnect", width='stretch')
 
     st.markdown("---")
+    show_labels = st.checkbox("Show marker labels", value=False)
     st.markdown("### Data & Filters")
     metric = st.radio("Bubble metric", ["power_mw", "co2_tonnes"], index=0, horizontal=True)
     live = st.checkbox("Live refresh", value=True)
@@ -314,6 +346,8 @@ else:
 if up is not None:
     try:
         df_lookup = pd.read_csv(up)
+        df_lookup['fuel_tech'] = df_lookup['fuel_tech'].apply(json.loads)
+        # print(df_lookup['fuel_tech'].head())
         if "facility_id" not in df_lookup.columns:
             st.warning("Missing 'facility_id' column in lookup CSV. Ignored.")
         else:
@@ -336,7 +370,9 @@ with sub:
 
     # Optional selectors only when we have data
     regions = sorted([r for r in df["region"].dropna().unique()]) if not df.empty else []
-    fuels = sorted([f for f in df["fuel_tech"].dropna().unique()]) if not df.empty else []
+    # fuels = sorted([f for f in df["fuel_tech"].dropna().unique()]) if not df.empty else []
+    fuels: list = sorted(set(f for sublist in df["fuel_tech"] for f in sublist)) if not df.empty else []
+    print(df['fuel_tech'].head())
 
     c1, c2, c3 = st.columns([2, 2, 3])
     with c1:
@@ -344,7 +380,7 @@ with sub:
     with c2:
         sel_fuels = st.multiselect("Fuel", options=fuels, default=fuels)
     with c3:
-        st.caption("Totals (filtered)")
+        st.caption("rs (filtered)")
         fdf = df.copy()
         if sel_regions:
             fdf = fdf[fdf["region"].isin(sel_regions)]
@@ -352,19 +388,22 @@ with sub:
             fdf = fdf[fdf["fuel_tech"].isin(sel_fuels)]
         total_power = float(fdf["power_mw"].fillna(0).sum()) if not fdf.empty else 0.0
         total_co2 = float(fdf["co2_tonnes"].fillna(0).sum()) if not fdf.empty else 0.0
-        m1, m2 = st.columns(2)
+        m1, m2, m3, m4 = st.columns(4)
         m1.metric("Total Power (MW)", f"{total_power:,.1f}")
         m2.metric("Total CO₂ (t)", f"{total_co2:,.1f}")
+        m3.metric("Total Power (MW)", f"{total_power:,.1f}")
+        m4.metric("Total CO₂ (t)", f"{total_co2:,.1f}")
 
     # Apply filters for map render
     if not df.empty:
         df = df[df["region"].isin(sel_regions)] if sel_regions else df
-        df = df[df["fuel_tech"].isin(sel_fuels)] if sel_fuels else df
+        # df = df[df["fuel_tech"].isin(sel_fuels)] if sel_fuels else df
+        df = df[df["fuel_tech"].apply(lambda fuels: any(f in sel_fuels for f in fuels))] if sel_fuels else df
 
     st.markdown(":earth_asia: **Live map**")
+    
     fmap = make_map(df, metric)
     st_folium(fmap, width=None, height=640)
-
     with st.expander("Latest readings (table)"):
         if not df.empty:
             show_cols = [
@@ -378,7 +417,7 @@ with sub:
                 "lat",
                 "lon",
             ]
-            st.dataframe(df[show_cols].sort_values("facility_id"), use_container_width=True)
+            st.dataframe(df[show_cols].sort_values("facility_id"), width='stretch')
         else:
             st.caption("Waiting for messages…")
 
