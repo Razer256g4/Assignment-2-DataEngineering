@@ -8,12 +8,14 @@ import time
 from collections import deque
 from dataclasses import dataclass, field
 from typing import Any, Dict, Optional
+import altair as alt
 
-import folium
+
 import numpy as np
 import pandas as pd
 import streamlit as st
-from streamlit_folium import st_folium
+import pydeck as pdk
+
 
 try:
     import paho.mqtt.client as mqtt
@@ -122,10 +124,16 @@ def _on_message(client, userdata: AppState, msg):
         print("paylod decode error: ", e)
         return
 
-    if "price_dmwh" in payload:
+    if ("price_dmwh" in payload) or ("price" in payload):
         with userdata.lock:
-            userdata.price_demand = payload
-            print("Price Demand Updated")
+                userdata.price_demand = {
+            "timestamp": payload.get("timestamp"),
+            "price_dmwh": float(payload.get("price_dmwh", payload.get("price", 0)) or 0),
+            "demand_mw": float(payload.get("demand_mw", payload.get("demand", 0)) or 0),
+            "region": payload.get("region"),
+        }
+        print("Price/Demand Updated")
+
 
     elif payload.get("facility_id"):
         d = _normalize_payload(payload) 
@@ -202,6 +210,39 @@ def start_mqtt_client(broker: str, port: int, topic: str, username: str | None, 
 # ----------------------------
 # Helpers for UI/rendering
 # ----------------------------
+def totals_timeseries(state: AppState, sel_regions=None, sel_fuels=None,
+                      bucket: str = "10s", horizon_min: int = 15) -> pd.DataFrame:
+    with state.lock:
+        hist = list(state.history)
+    if not hist:
+        return pd.DataFrame()
+
+    h = pd.DataFrame(hist)
+    # make sure numeric
+    for c in ("power_mw", "co2_tonnes"):
+        h[c] = pd.to_numeric(h.get(c), errors="coerce").fillna(0.0)
+
+    # filters (optional)
+    if sel_regions:
+        h = h[h.get("region").isin(sel_regions)]
+    if sel_fuels:
+        h["fuel_tech"] = h["fuel_tech"].apply(lambda x: x if isinstance(x, list)
+                                              else ([x] if pd.notna(x) and x != "" else []))
+        h = h[h["fuel_tech"].apply(lambda xs: any(x in sel_fuels for x in xs))]
+
+    # time window + resample
+    tz = "Australia/Sydney"
+    h["_ts"] = pd.to_datetime(h["_ts"], unit="s", utc=True).dt.tz_convert(tz)
+    cutoff = pd.Timestamp.now(tz=tz) - pd.Timedelta(minutes=horizon_min)
+    h = h[h["_ts"] >= cutoff]
+
+    if h.empty:
+        return pd.DataFrame()
+
+    out = (h.set_index("_ts")[["power_mw", "co2_tonnes"]]
+             .resample(bucket).sum()
+             .reset_index())
+    return out
 
 def dataframe_from_state(state: AppState) -> pd.DataFrame:
     with state.lock:
@@ -227,99 +268,117 @@ def dataframe_from_state(state: AppState) -> pd.DataFrame:
         if c not in df.columns:
             df[c] = np.nan
 
-    # Drop entries without coordinates
     df = df.dropna(subset=["lat", "lon"], how="any")
+    # NEW: always make fuel_tech a list so filters & labels work
+    df["fuel_tech"] = df["fuel_tech"].apply(
+        lambda x: x if isinstance(x, list) else ([x] if pd.notna(x) and x != "" else [])
+    )
     return df
 
 
-FUEL_COLORS = {
-    "Coal": "#3e3e3e",
-    "Black coal": "#3e3e3e",
-    "Brown coal": "#6b4226",
-    "Gas": "#d97706",
-    "Hydro": "#2563eb",
-    "Wind": "#16a34a",
-    "Solar": "#f59e0b",
-    "Battery": "#7c3aed",
-    "Bioenergy": "#15803d",
-    "Diesel": "#ef4444",
+# FUEL_COLORS = {
+#     "Coal": "#3e3e3e",
+#     "Black coal": "#3e3e3e",
+#     "Brown coal": "#6b4226",
+#     "Gas": "#d97706",
+#     "Hydro": "#2563eb",
+#     "Wind": "#16a34a",
+#     "Solar": "#f59e0b",
+#     "Battery": "#7c3aed",
+#     "Bioenergy": "#15803d",
+#     "Diesel": "#ef4444",
+# }
+
+COLOR = {
+    "Coal": [62, 62, 62],
+    "Black coal": [62, 62, 62],
+    "Brown coal": [107, 66, 38],
+    "Gas": [217, 119, 6],
+    "Hydro": [37, 99, 235],
+    "Wind": [22, 163, 74],
+    "Solar": [245, 158, 11],
+    "Battery": [124, 58, 237],
+    "Bioenergy": [21, 128, 61],
+    "Diesel": [239, 68, 68],
 }
 
 
-def make_map(df: pd.DataFrame, metric: str) -> folium.Map:
-    # Fallback center: Australia
-    center = (-35.0, 147.0)
-    if not df.empty:
-        center = (float(df["lat"].mean()), float(df["lon"].mean()))
-
-    fmap = folium.Map(location=center, zoom_start=6, tiles="cartodbpositron")
-
+def deck_from_df(df: pd.DataFrame, metric: str, show_labels: bool = False) -> pdk.Deck:
     if df.empty:
-        return fmap
+        view = pdk.ViewState(latitude=-25.0, longitude=133.0, zoom=4)
+        return pdk.Deck(layers=[], initial_view_state=view, map_style="https://basemaps.cartocdn.com/gl/positron-gl-style/style.json")
 
-    # Scale marker radius by metric (p95 as reference)
-    vals = df[metric].fillna(0).astype(float)
-    ref = max(1e-6, float(np.percentile(vals[vals > 0], 95)) if (vals > 0).any() else 1.0)
+    # robust numeric + p95 ref
+    m = pd.to_numeric(df[metric], errors="coerce").fillna(0.0)
+    pos = m[m > 0]
+    p95 = float(np.percentile(pos, 95)) if len(pos) else 1.0
 
-    for _, r in df.iterrows():
-        val = float(r.get(metric, 0.0) or 0.0)
-        val_ratio = np.clip(val / ref if ref != 0 else 0, 0.0, 1.0)
-        radius = 4.0 + 10.0 * np.sqrt(val_ratio)
-        # radius = 4.0 + 10.0 * np.sqrt(min(val / ref, 1.0))
+    data = df.copy()
 
-        # fuel = (r.get("fuel_tech") or "").strip()
-        fuel = (r.get("fuel_tech")[0] or "").strip()
-        color = FUEL_COLORS.get(fuel, "#64748b")
+    # bubble radius (meters): floor + sqrt scaling
+    data["_radius"] = 1000.0 * np.sqrt(np.clip(m / p95, 0.0, 1.0)) + 1000.0
 
-        name = r.get("facility_name") or r.get("facility_id")
-        region = r.get("region") or "—"
-        ts = r.get("timestamp") or "—"
-        other_metric = "co2_tonnes" if metric == "power_mw" else "power_mw"
-        other_val = r.get(other_metric)
+    # color from first fuel in list (or string), fallback grey
+    def _color_for(ft):
+        key = ""
+        if isinstance(ft, list) and ft:
+            key = str(ft[0]).strip()
+        elif isinstance(ft, str):
+            key = ft.strip()
+        return COLOR.get(key, [100, 100, 100])
 
-        popup_html = f"""
-        <div style='font-family:Inter,system-ui,Segoe UI,Roboto,Helvetica,Arial,sans-serif;min-width:220px'>
-          <div style='font-weight:700;margin-bottom:4px'>{name}</div>
-          <div style='font-size:12px;color:#475569;margin-bottom:6px'>Region: {region} • Fuel: {fuel or '—'}</div>
-          <div style='font-size:13px'><b>{'Power (MW)' if metric=='power_mw' else 'CO₂ (t)'}</b>: {val:,.3f}</div>
-          <div style='font-size:13px'><b>{'CO₂ (t)' if metric=='power_mw' else 'Power (MW)'}</b>: {other_val if other_val is not None else '—'}</div>
-          <div style='font-size:12px;color:#64748b;margin-top:6px'>Latest at: {ts}</div>
-        </div>
-        """
+    data["_color"] = data["fuel_tech"].apply(_color_for)
 
-        label = f"{name}<br>{val}{'MW' if metric == 'power_mw' else 't'}"
-        if show_labels:
-            folium.Marker(
-                location=(float(r["lat"]), float(r["lon"])),
-                icon=folium.DivIcon(html=f"""
-                    <div style="
-                        display: inline-block;
-                        font-size:14px;
-                        color:{color};
-                        background:white;
-                        border-radius:4px;
-                        padding:4px 8px;
-                        white-space:nowrap;
-                        box-shadow:0 1px 4px #0002
-                        margin-bottom: 28px; 
-                        text-align:center;
-                        transform:translate(-100%, -100%);
-                        position:relative;
-                    ">{label}</div>""")
-            ).add_to(fmap)
+    # coords sanity
+    data["lat"] = pd.to_numeric(data["lat"], errors="coerce")
+    data["lon"] = pd.to_numeric(data["lon"], errors="coerce")
+    data = data.dropna(subset=["lat", "lon"])
 
-        folium.CircleMarker(
-            location=(float(r["lat"]), float(r["lon"])),
-            radius=radius,
-            color=color,
-            weight=1,
-            fill=True,
-            fill_opacity=0.7,
-            popup=folium.Popup(popup_html, max_width=320),
-        ).add_to(fmap)
+    scatter = pdk.Layer(
+        "ScatterplotLayer",
+        data=data,
+        id="facilities",
+        get_position='[lon, lat]',
+        get_radius="_radius",
+        get_fill_color="_color",
+        pickable=True,
+        radius_min_pixels=3,
+        radius_max_pixels=60,
+        auto_highlight=True,
+        # smooth transitions between reruns
+        transitions={"get_radius": 300, "get_fill_color": 300},
+    )
 
-    folium.LayerControl().add_to(fmap)
-    return fmap
+    layers = [scatter]
+
+    if show_labels:
+        labels = pdk.Layer(
+            "TextLayer",
+            data=data,
+            id="labels",
+            get_position='[lon, lat]',
+            get_text="facility_name",
+            get_size=12,
+            get_color=[0, 0, 0],
+            get_alignment_baseline="'bottom'",
+        )
+        layers.append(labels)
+
+    view = pdk.ViewState(
+        latitude=float(data["lat"].mean()),
+        longitude=float(data["lon"].mean()),
+        zoom=4,
+    )
+    tooltip = {
+        "text": "{facility_name}\n{region} • {fuel_tech}\nPower: {power_mw} MW\nCO₂: {co2_tonnes} t\n{timestamp}"
+    }
+
+    return pdk.Deck(
+        layers=layers,
+        initial_view_state=view,
+        tooltip=tooltip,
+        map_style="https://basemaps.cartocdn.com/gl/positron-gl-style/style.json",
+    )
 
 
 # ----------------------------
@@ -398,12 +457,25 @@ with sub:
         if sel_regions:
             fdf = fdf[fdf["region"].isin(sel_regions)]
         if sel_fuels:
-            fdf = fdf[fdf["fuel_tech"].isin(sel_fuels)]
+            fdf = fdf[fdf["fuel_tech"].apply(lambda xs: any(x in sel_fuels for x in xs))]
+
         total_power = float(fdf["power_mw"].fillna(0).sum()) if not fdf.empty else 0.0
         total_co2 = float(fdf["co2_tonnes"].fillna(0).sum()) if not fdf.empty else 0.0
         m1, m2= st.columns(2)
         m1.metric("Total Power (MW)", f"{total_power:,.1f}")
         m2.metric("Total CO₂ (t)", f"{total_co2:,.1f}")
+    ts = totals_timeseries(state, sel_regions=sel_regions, sel_fuels=sel_fuels,
+                       bucket="10s", horizon_min=15)
+
+    st.markdown("#### Totals over time (last 15 min)")
+    if not ts.empty:
+        cts1, cts2 = st.columns(2)
+        with cts1:
+                st.line_chart(ts.set_index("_ts")["power_mw"], height=220)
+        with cts2:
+                st.line_chart(ts.set_index("_ts")["co2_tonnes"], height=220)
+    else:
+        st.caption("Waiting for enough data to draw totals…")
     with c4:
         
         st.caption(f"NEM Market:  {state.price_demand.get('timestamp', 'pending data...')}")
@@ -418,9 +490,9 @@ with sub:
         df = df[df["fuel_tech"].apply(lambda fuels: any(f in sel_fuels for f in fuels))] if sel_fuels else df
 
     st.markdown(":earth_asia: **Live map**")
-    
-    fmap = make_map(df, metric)
-    st_folium(fmap, width=None, height=640)
+    deck = deck_from_df(df, metric, show_labels=show_labels)
+    st.pydeck_chart(deck, use_container_width=True, key="deck_map")
+
     with st.expander("Latest readings (table)"):
         if not df.empty:
             show_cols = [
