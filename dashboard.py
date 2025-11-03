@@ -112,14 +112,17 @@ def _on_connect(client, userdata: AppState, flags, rc, properties=None):
     client.subscribe(userdata.topic, qos=1)
     userdata.connected = True
 
+def _on_subscribe(client, userdata, mid, reason_codes, properties):
+    print(f"Subscribed successfully!")
 
 def _on_message(client, userdata: AppState, msg):
     try:
         payload = json.loads(msg.payload.decode("utf-8"))
-    except Exception:
+    except Exception as e:
+        print("paylod decode error: ", e)
         return
 
-    if payload.get("price_dmwh"):
+    if "price_dmwh" in payload:
         with userdata.lock:
             userdata.price_demand = payload
             print("Price Demand Updated")
@@ -156,7 +159,7 @@ def _on_message(client, userdata: AppState, msg):
             # Append to short history for optional charts/debug
             userdata.history.append({**d, "_ts": time.time()})
 
-        print("Check latest_by_facility: ", len(userdata.latest_by_facility))
+        print("Check latest_by_facility len: ", len(userdata.latest_by_facility))
 
 @st.cache_resource(show_spinner=False)
 def start_mqtt_client(broker: str, port: int, topic: str, username: str | None, password: str | None) -> AppState:
@@ -184,6 +187,7 @@ def start_mqtt_client(broker: str, port: int, topic: str, username: str | None, 
     client.user_data_set(state)
     client.on_connect = _on_connect
     client.on_message = _on_message
+    client.on_subscribe = _on_subscribe
 
     try:
         client.connect(broker, port, keepalive=60)
@@ -259,7 +263,9 @@ def make_map(df: pd.DataFrame, metric: str) -> folium.Map:
 
     for _, r in df.iterrows():
         val = float(r.get(metric, 0.0) or 0.0)
-        radius = 4.0 + 10.0 * np.sqrt(min(val / ref, 1.0))
+        val_ratio = np.clip(val / ref if ref != 0 else 0, 0.0, 1.0)
+        radius = 4.0 + 10.0 * np.sqrt(val_ratio)
+        # radius = 4.0 + 10.0 * np.sqrt(min(val / ref, 1.0))
 
         # fuel = (r.get("fuel_tech") or "").strip()
         fuel = (r.get("fuel_tech")[0] or "").strip()
