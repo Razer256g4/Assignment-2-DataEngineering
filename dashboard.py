@@ -107,6 +107,20 @@ def _normalize_payload(msg: Dict[str, Any]) -> Dict[str, Any]:
             d[f] = d[f].strip()
 
     return d
+def _to_float(x, default=0.0):
+    try:
+        if x is None:
+            return default
+        if isinstance(x, str):
+            x = x.strip().replace("$", "").replace(",", "")
+            if x == "" or x.lower() in {"nan", "inf", "-inf"}:
+                return default
+        v = float(x)
+        if np.isnan(v) or np.isinf(v):
+            return default
+        return v
+    except Exception:
+        return default
 
 
 def _on_connect(client, userdata: AppState, flags, rc, properties=None):
@@ -116,58 +130,62 @@ def _on_connect(client, userdata: AppState, flags, rc, properties=None):
 
 def _on_subscribe(client, userdata, mid, reason_codes, properties):
     print(f"Subscribed successfully!")
-
 def _on_message(client, userdata: AppState, msg):
     try:
         payload = json.loads(msg.payload.decode("utf-8"))
     except Exception as e:
-        print("paylod decode error: ", e)
+        print("payload decode error:", e)
         return
 
-    if ("price_dmwh" in payload) or ("price" in payload):
-        with userdata.lock:
+    # ----- MARKET SNAPSHOT (keep publisher unchanged) -----
+    # Any packet that carries price/demand and has no facility_id is treated as market.
+    if (("price_dmwh" in payload) or ("demand_mw" in payload) or ("price" in payload)) \
+       and not payload.get("facility_id"):
+        ts = payload.get("timestamp")
+        if ts != "starting...":  # ignore warm-start zeros
+            with userdata.lock:
                 userdata.price_demand = {
-            "timestamp": payload.get("timestamp"),
-            "price_dmwh": float(payload.get("price_dmwh", payload.get("price", 0)) or 0),
-            "demand_mw": float(payload.get("demand_mw", payload.get("demand", 0)) or 0),
-            "region": payload.get("region"),
-        }
-        print("Price/Demand Updated")
+                    "timestamp": ts,
+                    "price_dmwh": _to_float(payload.get("price_dmwh", payload.get("price"))),
+                    "demand_mw":  _to_float(payload.get("demand_mw", payload.get("demand"))),
+                    "region": payload.get("region"),
+                }
+                userdata.market_history.append({
+                "_ts": time.time(),
+                "price_dmwh": userdata.price_demand["price_dmwh"],
+                "demand_mw": userdata.price_demand["demand_mw"],
+    })
+            print("Market update:", userdata.price_demand)
+        return  # <<< don't fall through
 
+    # ----- FACILITY SNAPSHOT -----
+    if payload.get("facility_id"):
+        d = _normalize_payload(payload)
 
-    elif payload.get("facility_id"):
-        d = _normalize_payload(payload) 
-        # print(d)
-
-        # Enrich with lookup if lat/lon missing
+        # Enrich with lookup if needed
         if userdata.facility_lookup is not None:
             fid = d.get("facility_id")
             if fid and (pd.isna(d.get("lat")) or pd.isna(d.get("lon")) or d.get("lat") is None or d.get("lon") is None):
                 try:
                     row = userdata.facility_lookup.loc[fid]
-                    # print(row)
                     d.setdefault("facility_name", row.get("facility_name"))
                     d.setdefault("region", row.get("region"))
                     d.setdefault("fuel_tech", row.get("fuel_tech"))
                     d.setdefault("lat", float(row.get("lat")))
                     d.setdefault("lon", float(row.get("lon")))
                 except Exception as e:
-                    print("Exception encountered: ", e)
-                    pass
+                    print("lookup enrich error:", e)
 
         fid = d.get("facility_id")
         if not fid:
             return
 
         with userdata.lock:
-            # Keep latest per facility
-            d.pop('facility_id', None)
+            d.pop("facility_id", None)
             prev = userdata.latest_by_facility.get(fid, {})
             userdata.latest_by_facility[fid] = {**prev, **d}
-            # Append to short history for optional charts/debug
             userdata.history.append({**d, "_ts": time.time()})
-
-        print("Check latest_by_facility len: ", len(userdata.latest_by_facility))
+        return
 
 @st.cache_resource(show_spinner=False)
 def start_mqtt_client(broker: str, port: int, topic: str, username: str | None, password: str | None) -> AppState:
@@ -405,28 +423,11 @@ with st.sidebar:
     live = st.checkbox("Live refresh", value=True)
     refresh_sec = st.slider("Refresh every (s)", min_value=1, max_value=10, value=3)
 
-    st.markdown("#### Facility lookup (optional)")
-    up = st.file_uploader("Upload facility_lookup.csv", type=["csv"], help="Columns: facility_id, facility_name, region, fuel_tech, lat, lon")
-
 # Start / restart client if requested
 if connect:
     state = start_mqtt_client(broker, int(port), topic, username or None, password or None)
 else:
     state = get_state()
-
-# Attach uploaded lookup once; update state if provided
-if up is not None:
-    try:
-        df_lookup = pd.read_csv(up)
-        df_lookup['fuel_tech'] = df_lookup['fuel_tech'].apply(json.loads)
-        # print(df_lookup['fuel_tech'].head())
-        if "facility_id" not in df_lookup.columns:
-            st.warning("Missing 'facility_id' column in lookup CSV. Ignored.")
-        else:
-            state.facility_lookup = df_lookup.set_index("facility_id")
-            st.success(f"Loaded lookup: {len(df_lookup):,} rows")
-    except Exception as e:
-        st.warning(f"Failed to read lookup CSV — {e}")
 
 # ----------------------------
 # Main area
@@ -477,11 +478,14 @@ with sub:
     else:
         st.caption("Waiting for enough data to draw totals…")
     with c4:
-        
-        st.caption(f"NEM Market:  {state.price_demand.get('timestamp', 'pending data...')}")
+        pdict = state.price_demand or {}
+        price_val  = _to_float(pdict.get("price_dmwh"))
+        demand_val = _to_float(pdict.get("demand_mw"))
+        ts_label   = pdict.get("timestamp", "pending data...")
+        st.caption(f"NEM Market: {ts_label}")
         m3, m4 = st.columns(2)
-        m3.metric("Price ($/MWh)", f"{state.price_demand.get('price_dmwh', 0):,.1f}")
-        m4.metric("Demand (MW)", f"{state.price_demand.get('demand_mw', 0):,.1f}")
+        m3.metric("Price ($/MWh)", f"{price_val:,.1f}")
+        m4.metric("Demand (MW)",   f"{demand_val:,.1f}")
 
     # Apply filters for map render
     if not df.empty:

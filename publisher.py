@@ -29,6 +29,8 @@ class MqttPublisher:
 
   def warm_start(self):
     data = {
+      "kind": "market",       
+      "market_id": "NEM",
       "timestamp": "starting...",
       "price_dmwh": 0,
       "demand_mw": 0
@@ -51,6 +53,7 @@ if __name__ == "__main__":
     # Publish per-facility power-emission data
     for fac in facilities:
       data = dict(
+          kind="facility",
         facility_id = fac,
         timestamp = timestamp,
         power_mw = row.get(f"power_{fac}", 0),
@@ -61,9 +64,11 @@ if __name__ == "__main__":
 
     # Publish per-market price-demand data
     data = dict(
+      kind="market",
+      market_id="NEM",
       timestamp = timestamp,
-      price_dmwh = row.get('NEM_price', 0),
-      demand_mw = row.get("NEM_demand", 0)
+      price_dmwh = row.get('NEM_price',  row.get('price_NEM', 0)),
+      demand_mw = row.get('NEM_demand', row.get('demand_NEM', 0)),
     )
     # print(data)
     pub.publish(data)
