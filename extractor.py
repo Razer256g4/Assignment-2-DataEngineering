@@ -8,6 +8,10 @@ from dotenv import load_dotenv
 from datetime import datetime, timedelta
 
 load_dotenv()
+""" ENVIRONMENT VARIABLE SETUP
+You need a .env file in project directory with OPENELECTRICITY_API_KEY
+Sign up & create API KEY for Open Electricity https://platform.openelectricity.org.au/"
+"""
 
 BASE_URL = "https://api.openelectricity.org.au/v4"
 HEADERS = {"Authorization" : f"Bearer {os.environ['OPENELECTRICITY_API_KEY']}"}
