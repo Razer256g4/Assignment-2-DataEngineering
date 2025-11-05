@@ -59,7 +59,7 @@ def batch_facilities(batch_size: int = 25) -> dict:
     
     # 1. Filter for NEM facilities with at least 1 operating unit
     # facilities: dict = json.load(open(PATH_TO_FACILITIES_JSON, "r")).get("data")
-    facilities = nem_facilities_json.get("data")
+    facilities: dict = nem_facilities_json.get("data")
     assert facilities != None, "facilities should not be None"
     # fueltech_map: dict = json.load(open(PATH_TO_FUELTECH_JSON, "r")) # https://docs.openelectricity.org.au/guides/fueltechs
     fueltech_map: dict = fueltech_map_json
