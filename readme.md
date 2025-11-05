@@ -35,12 +35,12 @@
 cd Assignment-2-DataEngineering
 # activate python env with vene or conda
 
-# Extract Data from OEM
+# From new terminal, extract data from OEM
 python extractor.py
 
-# Start Dashboard
+# From new terminal, start Dashboard
 streamlit run dashboard.py
 
-# Start Publishing from Cache file
+# From new terminal, start Publishing from Cache file
 python publisher.py
 ```

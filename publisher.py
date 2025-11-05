@@ -5,6 +5,8 @@ import paho.mqtt.client as mqtt
 import json
 import time
 
+MSG_BROKER_HOSTNAME = "test.mosquitto.org"
+MSG_BROKER_TOPIC = "comp5339/t01_group8"
 PATH_TO_CACHE_FILE = "data/consolidate.csv"
 
 class MqttPublisher:
@@ -23,7 +25,6 @@ class MqttPublisher:
       print(f"Error publishing: {result.rc}")
     else:
       time.sleep(0.1)
-    #   print(f"Publish result: {result}")
 
   def warm_start(self):
     data = {
@@ -49,7 +50,7 @@ def main():
   region_codes = sorted( col.removeprefix('price_') for col in cache_df.columns if 'price' in col )
   
   # connect to message broker
-  pub = MqttPublisher("test.mosquitto.org", "nem/power_emissions")
+  pub = MqttPublisher(MSG_BROKER_HOSTNAME, MSG_BROKER_TOPIC)
   
   while (1): 
 
@@ -59,7 +60,7 @@ def main():
       formatted_time: str = datetime.fromisoformat(timestamp).strftime("%d-%b-%Y %H:%M")
 
       # publish per-facility power-emission data
-      for fac in facility_codes[:2]:
+      for fac in facility_codes:
         pub.publish(dict(
           # format of power-emission event
           facility_id = fac,
@@ -69,7 +70,7 @@ def main():
         ))
 
       # publish per-region price-demand data
-      for reg in region_codes[:2]:
+      for reg in region_codes:
         pub.publish(dict(
           # format of price-demand event
           region_id = reg,
