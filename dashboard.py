@@ -147,7 +147,7 @@ def on_message(client, userdata: AppState, msg):
     
     # Handle Facility Event
     if "facility_id" in payload:
-      # print(f"[on_message] facility event: {payload}")
+      # print(f"[on_message] facility event: {payload}") # debug
       validated: dict = FacilityPayload(**payload).model_dump()
       fid: str = validated.pop("facility_id", None)
       
@@ -173,7 +173,7 @@ def on_message(client, userdata: AppState, msg):
 
     # Handle Market Event
     elif "region_id" in payload:
-      print(f"[on_message] market event: {payload}")
+    #   print(f"[on_message] market event: {payload}") # debug
       validated: dict = MarketPayload(**payload).model_dump()
       rid = validated.pop("region_id", None)
 
@@ -243,6 +243,37 @@ def start_mqtt_client(broker: str, port: int, topic: str) -> AppState:
 # ---
 # Frontend Development
 # ---
+# facility_df
+# facility_id, facility_name, region, timestamp, power_mw, co2_tonnes, lat, lon, fuel_tech
+# market_data
+# region_id, region_name, timestamp, price_dmwh, demand_mw
+
+def prepare_data_from_state(state: AppState):
+  """ Prepare the data in the format ready to use for visualization """
+  if not state.latest_by_facility:
+    return (
+      pd.DataFrame(columns=["facility_id", "facility_name", "region", "timestamp", "power_mw", "co2_tonnes", "lat", "lon", "fuel_tech"]), 
+      pd.DataFrame(columns=["region_id", "region_name", "timestamp", "price_dmwh", "demand_mw"]), 
+      [], []
+    )
+
+  facility_df = pd.DataFrame.from_dict(state.latest_by_facility, orient="index").reset_index(names=['facility_id'])
+  facility_df['region'] = facility_df['region'].apply(lambda code: state.region_lookup.loc[code, 'region_name']) # so as to filter on selected region names
+  fuel_types: list = sorted(facility_df['fuel_tech'].explode().dropna().unique().tolist()) # options for fuel selector
+  region_names:list = facility_df['region'].unique().tolist()
+  
+
+  if not state.latest_by_region:
+     return (
+      facility_df, 
+      pd.DataFrame(columns=["region_id", "region_name", "timestamp", "price_dmwh", "demand_mw"]),
+      region_names, fuel_types
+     )
+  
+  market_df = pd.DataFrame.from_dict(state.latest_by_region, orient="index").reset_index(names=['region_id'])
+  region_names: list = sorted(market_df['region_name'].tolist()) # options for region selector
+  
+  return facility_df, market_df, region_names, fuel_types
 
 # copied over
 def totals_timeseries(state: AppState, sel_regions=None, sel_fuels=None,
@@ -281,41 +312,6 @@ def totals_timeseries(state: AppState, sel_regions=None, sel_fuels=None,
              .resample(bucket).sum()
              .reset_index())
     return out
-
-
-# facility_df
-# facility_id, facility_name, region, timestamp, power_mw, co2_tonnes, lat, lon, fuel_tech
-# market_data
-# region_id, region_name, timestamp, price_dmwh, demand_mw
-
-def prepare_data_from_state(state: AppState):
-  """ Prepare the data in the format ready to use for visualization """
-  if not state.latest_by_facility:
-    return (
-      pd.DataFrame(columns=["facility_id", "facility_name", "region", "timestamp", "power_mw", "co2_tonnes", "lat", "lon", "fuel_tech"]), 
-      pd.DataFrame(columns=["region_id", "region_name", "timestamp", "price_dmwh", "demand_mw"]), 
-      [], []
-    )
-
-  facility_df = pd.DataFrame.from_dict(state.latest_by_facility, orient="index").reset_index(names=['facility_id'])
-  facility_df['region'] = facility_df['region'].apply(lambda code: state.region_lookup.loc[code, 'region_name']) # so as to filter on selected region names
-  fuel_types: list = sorted(facility_df['fuel_tech'].explode().dropna().unique().tolist()) # options for fuel selector
-  region_names:list = facility_df['region'].unique().tolist()
-  
-
-  if not state.latest_by_region:
-     return (
-      facility_df, 
-      pd.DataFrame(columns=["region_id", "region_name", "timestamp", "price_dmwh", "demand_mw"]),
-      region_names, fuel_types
-     )
-  
-  # print(state.latest_by_region)
-  market_df = pd.DataFrame.from_dict(state.latest_by_region, orient="index").reset_index(names=['region_id'])
-  # print(market_df)
-  region_names: list = sorted(market_df['region_name'].tolist()) # options for region selector
-  
-  return facility_df, market_df, region_names, fuel_types
 
 # copied over
 def deck_from_df(df: pd.DataFrame, metric: str, show_labels: bool = False) -> pdk.Deck:
