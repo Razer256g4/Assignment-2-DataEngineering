@@ -1,4 +1,5 @@
 import os
+import time
 import json
 import requests
 import pandas as pd
@@ -123,6 +124,7 @@ def fetch_with_retry(url: str, query_params: dict, retry_limit:int =3):
     if response.status_code!= 200:
       print(f"[fetch_with_retry] error on attempt {retry_counter}: [{response.status_code}] {response.text}")
       retry_counter+=1
+      time.sleep(10)
 
       if retry_counter == retry_limit:
          print(f"[fetch_with_retry] exit after {retry_limit} attempts")
