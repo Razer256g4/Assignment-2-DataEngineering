@@ -3,6 +3,7 @@ import time
 import json
 import pandas as pd
 import numpy as np
+import emoji
 
 from collections import deque
 from dataclasses import dataclass, field
@@ -16,19 +17,37 @@ import pydeck as pdk
 
 MSG_BROKER_HOSTNAME = "test.mosquitto.org"
 MSG_BROKER_TOPIC = "comp5339/t01_group8"
-COLOR = {
-    "Coal": [62, 62, 62],
-    "Black coal": [62, 62, 62],
-    "Brown coal": [107, 66, 38],
-    "Gas": [217, 119, 6],
-    "Hydro": [37, 99, 235],
-    "Wind": [22, 163, 74],
-    "Solar": [245, 158, 11],
-    "Battery": [124, 58, 237],
-    "Bioenergy": [21, 128, 61],
-    "Diesel": [239, 68, 68],
+
+## Helpers for Map Visualization
+FUEL_TO_EMOJI_ALIAS: Dict[str, str] = {
+    "Coal": ":rock:", "Black coal": ":rock:", "Brown coal": ":rock:",
+    "Gas": ":fire:", "Hydro": ":droplet:", "Wind": ":wind_face:",
+    "Solar": ":sun_with_face:", "Battery": ":battery:",
+    "Bioenergy": ":seedling:", "Diesel": ":fuel_pump:",
 }
 
+def emojialias_to_char(alias: str) -> str:
+    return emoji.emojize(alias, language="alias")
+
+def emoji_char_to_twemoji_url(ch: str) -> str:
+    codepoints = "-".join(f"{ord(c):x}" for c in ch)
+    return f"https://cdn.jsdelivr.net/gh/twitter/twemoji@14.0.2/assets/72x72/{codepoints}.png"
+
+def get_icon_url_from_fuel(fuel_tech_value: Any) -> str:
+    name = (fuel_tech_value[0] if isinstance(fuel_tech_value, list) and fuel_tech_value
+            else str(fuel_tech_value or "")).strip()
+    alias = FUEL_TO_EMOJI_ALIAS.get(name, ":zap:")
+    return emoji_char_to_twemoji_url(emojialias_to_char(alias))
+
+def compute_marker_size(metric_values: pd.Series, pctl: float = 95.0) -> np.ndarray:
+    x = pd.to_numeric(metric_values, errors="coerce").fillna(0.0)
+    p = float(np.percentile(x[x > 0], pctl)) if (x > 0).any() else 1.0
+    return (12 + 24 * np.sqrt(np.clip(x / p, 0.0, 1.0))).astype(float)
+
+def sanitize_coordinates(df: pd.DataFrame) -> pd.DataFrame:
+    df["lat"] = pd.to_numeric(df["lat"], errors="coerce")
+    df["lon"] = pd.to_numeric(df["lon"], errors="coerce")
+    return df.dropna(subset=["lat", "lon"])
 # ----------------------------
 # Page config
 # ----------------------------
@@ -314,82 +333,52 @@ def totals_timeseries(state: AppState, sel_regions=None, sel_fuels=None,
     return out
 
 # copied over
-def deck_from_df(df: pd.DataFrame, metric: str, show_labels: bool = False) -> pdk.Deck:
-    if df.empty:
+def deck_from_df(facility_df: pd.DataFrame, metric: str, show_labels: bool = False) -> pdk.Deck:
+    if facility_df.empty:
         view = pdk.ViewState(latitude=-25.0, longitude=133.0, zoom=4)
-        return pdk.Deck(layers=[], initial_view_state=view, map_style="https://basemaps.cartocdn.com/gl/positron-gl-style/style.json")
+        return pdk.Deck(layers=[], initial_view_state=view,
+                        map_style="https://basemaps.cartocdn.com/gl/positron-gl-style/style.json")
 
-    # robust numeric + p95 ref
-    m = pd.to_numeric(df[metric], errors="coerce").fillna(0.0)
-    pos = m[m > 0]
-    p95 = float(np.percentile(pos, 95)) if len(pos) else 1.0
+    data = sanitize_coordinates(facility_df.copy())
+    data["icon_url"] = data["fuel_tech"].apply(get_icon_url_from_fuel)
+    data["_icon_size"] = compute_marker_size(data[metric])
+    data["icon_data"] = data["icon_url"].apply(lambda url: {"url": url, "width": 72, "height": 72, "anchorY": 72})
 
-    data = df.copy()
-
-    # bubble radius (meters): floor + sqrt scaling
-    data["_radius"] = 1000.0 * np.sqrt(np.clip(m / p95, 0.0, 1.0)) + 1000.0
-
-    # color from first fuel in list (or string), fallback grey
-    def _color_for(ft):
-        key = ""
-        if isinstance(ft, list) and ft:
-            key = str(ft[0]).strip()
-        elif isinstance(ft, str):
-            key = ft.strip()
-        return COLOR.get(key, [100, 100, 100])
-
-    data["_color"] = data["fuel_tech"].apply(_color_for)
-
-    # coords sanity
-    data["lat"] = pd.to_numeric(data["lat"], errors="coerce")
-    data["lon"] = pd.to_numeric(data["lon"], errors="coerce")
-    data = data.dropna(subset=["lat", "lon"])
-
-    scatter = pdk.Layer(
-        "ScatterplotLayer",
+    icon_layer = pdk.Layer(
+        "IconLayer",
         data=data,
-        id="facilities",
+        id="facility-icons",
+        get_icon="icon_data",
+        get_size="_icon_size",
+        size_scale=1,
         get_position='[lon, lat]',
-        get_radius="_radius",
-        get_fill_color="_color",
         pickable=True,
-        radius_min_pixels=3,
-        radius_max_pixels=60,
-        auto_highlight=True,
-        # smooth transitions between reruns
-        transitions={"get_radius": 300, "get_fill_color": 300},
+        billboard=True,
+        transitions={"get_size": 300},
     )
 
-    layers = [scatter]
-
+    layers = [icon_layer]
     if show_labels:
-        labels = pdk.Layer(
+        layers.append(pdk.Layer(
             "TextLayer",
             data=data,
-            id="labels",
+            id="facility-labels",
             get_position='[lon, lat]',
             get_text="facility_name",
             get_size=12,
             get_color=[0, 0, 0],
-            get_alignment_baseline="'bottom'",
-        )
-        layers.append(labels)
+            get_alignment_baseline="bottom",
+        ))
 
-    view = pdk.ViewState(
-        latitude=float(data["lat"].mean()),
-        longitude=float(data["lon"].mean()),
-        zoom=4,
-    )
-    tooltip = {
-        "text": "{facility_name}\n{region} • {fuel_tech}\nPower: {power_mw} MW\nCO₂: {co2_tonnes} t\n{timestamp}"
-    }
+    view = pdk.ViewState(latitude=float(data["lat"].mean()),
+                         longitude=float(data["lon"].mean()), zoom=4)
+    tooltip = {"text": "{facility_name}\n{region} • {fuel_tech}\n"
+                       f"{'Power' if metric=='power_mw' else 'CO₂'}: {{{metric}}}\n"
+                       "{timestamp}"}
+    return pdk.Deck(layers=layers, initial_view_state=view, tooltip=tooltip,
+                    map_style="https://basemaps.cartocdn.com/gl/positron-gl-style/style.json")
 
-    return pdk.Deck(
-        layers=layers,
-        initial_view_state=view,
-        tooltip=tooltip,
-        map_style="https://basemaps.cartocdn.com/gl/positron-gl-style/style.json",
-    )  
+
 
 
 # Side Bar
@@ -399,7 +388,7 @@ with st.sidebar:
   port = st.number_input("Port", value=1883, min_value=1, max_value=65535, step=1)
   topic = st.text_input("Topic", value=MSG_BROKER_TOPIC)
   
-  connect = st.button("Connect / Reconnect", width='stretch')
+  connect = st.button("Connect / Reconnect", width = "stretch")
   st.markdown("---")
   show_labels = st.checkbox("Show marker labels", value=False)
   st.markdown("### Data & Filters")
@@ -469,7 +458,7 @@ with st.container():
   # Map Display
   st.markdown(":earth_asia: **Live map**")
   deck = deck_from_df(fdf, metric, show_labels=show_labels)
-  st.pydeck_chart(deck, width='stretch', key="deck_map")
+  st.pydeck_chart(deck,width='stretch', key="deck_map")
 
   # DataFrame Display
   with st.expander("Latest readings (table)", expanded=False):
