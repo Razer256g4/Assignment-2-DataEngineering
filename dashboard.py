@@ -111,8 +111,8 @@ def enrich_facility_lookup(userdata: AppState, fid: str, payload: dict):
       conn.execute(text(insert_facility_sql), {"facility_id": fid ,**facility})
       print(f"[postgresql] {fid} inserted to oem.facility_lookup")
   
-  # Add to app's state
-  userdata.facility_lookup.loc[fid] = facility
+      # Add to app's state
+      userdata.facility_lookup.loc[fid] = facility
 
 # --
 # Data Validation
@@ -154,7 +154,6 @@ def on_message(client, userdata: AppState, msg):
       if fid not in userdata.facility_lookup.index:
         enrich_facility_lookup(userdata, fid, payload)
 
-      # enrich event
       try:
         row = userdata.facility_lookup.loc[fid]
         validated.setdefault("facility_name", row.get("facility_name"))
@@ -163,6 +162,7 @@ def on_message(client, userdata: AppState, msg):
         validated.setdefault("lat", float(row.get("lat")))
         validated.setdefault("lon", float(row.get("lon")))
       except KeyError:
+        # fid does not exist in NGER dataset as well
         print(f"[on_message] {fid} does not exist in facility lookup")
         return
 
