@@ -21,7 +21,7 @@ MSG_BROKER_TOPIC = "comp5339/t01_group8"
 ## Helpers for Map Visualization
 FUEL_TO_EMOJI_ALIAS: Dict[str, str] = {
     "Coal": ":rock:", "Black coal": ":rock:", "Brown coal": ":rock:",
-    "Gas": ":fire:", "Hydro": ":droplet:", "Wind": ":wind_face:",
+    "Gas": ":fire:", "Hydro": ":droplet:", "Wind": ":dash:",
     "Solar": ":sun_with_face:", "Battery": ":battery:",
     "Bioenergy": ":seedling:", "Diesel": ":fuel_pump:",
 }
@@ -30,8 +30,9 @@ def emojialias_to_char(alias: str) -> str:
     return emoji.emojize(alias, language="alias")
 
 def emoji_char_to_twemoji_url(ch: str) -> str:
-    codepoints = "-".join(f"{ord(c):x}" for c in ch)
+    codepoints = "-".join(f"{ord(c):x}" for c in ch).replace("-fe0f", "")
     return f"https://cdn.jsdelivr.net/gh/twitter/twemoji@14.0.2/assets/72x72/{codepoints}.png"
+
 
 def get_icon_url_from_fuel(fuel_tech_value: Any) -> str:
     name = (fuel_tech_value[0] if isinstance(fuel_tech_value, list) and fuel_tech_value
@@ -359,16 +360,17 @@ def deck_from_df(facility_df: pd.DataFrame, metric: str, show_labels: bool = Fal
 
     layers = [icon_layer]
     if show_labels:
-        layers.append(pdk.Layer(
-            "TextLayer",
-            data=data,
-            id="facility-labels",
-            get_position='[lon, lat]',
-            get_text="facility_name",
-            get_size=12,
-            get_color=[0, 0, 0],
-            get_alignment_baseline="bottom",
-        ))
+            labels = pdk.Layer(
+                "TextLayer",
+                data=data,
+                id="labels",
+                get_position='[lon, lat]',
+                get_text="facility_name",
+                get_size=12,
+                get_color=[0, 0, 0],
+                get_alignment_baseline="'bottom'",
+            )
+            layers.append(labels)
 
     view = pdk.ViewState(latitude=float(data["lat"].mean()),
                          longitude=float(data["lon"].mean()), zoom=4)
