@@ -19,6 +19,129 @@ import pydeck as pdk
 
 MSG_BROKER_HOSTNAME = "test.mosquitto.org"
 MSG_BROKER_TOPIC = "comp5339/t01_group8"
+## Map Legends and Helpers
+# ---- Legends (single overlay) ----
+def _legend_css() -> str:
+    return """
+    <style>
+      .nem-legend-wrap{
+        position:fixed; right:16px; bottom:16px; z-index:9999;
+        max-width:280px; color:#111; pointer-events:none;
+      }
+      .nem-legend{
+        background:rgba(255,255,255,.92);
+        border:1px solid rgba(0,0,0,.12);
+        border-radius:12px; padding:10px 12px;
+        box-shadow:0 6px 20px rgba(0,0,0,.18);
+        font-size:12px; line-height:1.35;
+        backdrop-filter:saturate(1.2) blur(4px);
+      }
+      .nem-legend h4{
+        margin:0 0 8px 0; font-weight:700; font-size:12.5px;
+      }
+      .nem-legend .sec{ margin-top:10px; }
+      .nem-legend .row{ display:flex; align-items:center; gap:8px; margin:3px 0; }
+      .nem-legend .sw{ width:14px; height:14px; border-radius:3px;
+        border:1px solid rgba(0,0,0,.25); display:inline-block }
+      .nem-ico{ width:18px; height:18px; display:inline-block; }
+      .nem-b{ display:inline-block; border-radius:999px;
+        border:1px solid rgba(0,0,0,.25); background:rgba(0,0,0,.06); }
+      .nem-b-row{ display:flex; align-items:center; gap:8px; margin:4px 0; }
+      .nem-b-label{ min-width:56px; text-align:right; }
+      @media (prefers-color-scheme: dark){
+        .nem-legend{ background:rgba(20,20,20,.88); color:#eee;
+          border-color:rgba(255,255,255,.12); }
+        .nem-legend .sw{ border-color:rgba(255,255,255,.25); }
+        .nem-b{ background:rgba(255,255,255,.08); border-color:rgba(255,255,255,.25); }
+      }
+    </style>
+    """
+
+def _legend_regions_html(selected_region_names: list[str]) -> str:
+    if not selected_region_names:
+        return ""
+    lookup = get_state().region_lookup
+    name_to_id = {lookup.loc[rid, "region_name"]: rid for rid in lookup.index}
+    rows = []
+    for name in selected_region_names:
+        rid = name_to_id.get(name)
+        if not rid:
+            continue
+        r,g,b,a = constants.REGION_COLORS.get(rid, [200,200,200,90])
+        rows.append(
+            f'<div class="row"><span class="sw" '
+            f'style="background: rgba({r},{g},{b},{a/255:.2f});"></span>{name}</div>'
+        )
+    return "" if not rows else f'<div class="sec"><h4>Regions</h4>{"".join(rows)}</div>'
+
+def _legend_fuels_html(facilities_df: pd.DataFrame, selected_fuels: list[str]) -> str:
+    if facilities_df.empty or "fuel_tech" not in facilities_df:
+        return ""
+    fuels = sorted(set(facilities_df["fuel_tech"].explode().dropna().astype(str)))
+    if selected_fuels:
+        keep = set(selected_fuels)
+        fuels = [f for f in fuels if f in keep]
+    if not fuels:
+        return ""
+    rows = []
+    for f in fuels:
+        rows.append(
+            f'<div class="row"><img class="nem-ico" src="{get_icon_url_from_fuel(f)}" alt="{f}"/>'
+            f'<span>{f}</span></div>'
+        )
+    return f'<div class="sec"><h4>Fuel icons</h4>{"".join(rows)}</div>'
+
+def _legend_sizes_html(values: pd.Series, metric_label: str) -> str:
+    x = pd.to_numeric(values, errors="coerce").fillna(0.0)
+    pos = x[x > 0]
+    if pos.empty:
+        return ""
+    p95 = float(np.percentile(pos, 95))
+    def px(v: float) -> int:
+        return int(12 + 24 * np.sqrt(np.clip(v/p95, 0.0, 1.0)))
+    ticks = [0.1*p95, 0.3*p95, 0.6*p95, 1.0*p95]
+    bubbles = [
+        f'<div class="nem-b-row"><span class="nem-b" style="width:{px(t)}px;height:{px(t)}px;"></span>'
+        f'<span class="nem-b-label">{t:,.0f}</span></div>'
+        for t in ticks
+    ]
+    return f'<div class="sec"><h4>Marker size → {metric_label}</h4>{"".join(bubbles)}</div>'
+
+def show_legend(render_legends, show_region_hues, metric, selected_regions, selected_fueltypes, fdf):
+    if "show_legends" not in st.session_state:
+        st.session_state.show_legends = False
+
+  # ---- sidebar control ----
+    with st.sidebar:
+        if st.button("Legend", use_container_width=True):
+            st.session_state.show_legends = not st.session_state.show_legends
+    if st.session_state.show_legends:
+            render_legends(
+              show_region_hues,
+              selected_regions,
+              selected_fueltypes,
+              fdf,
+              metric,
+          )
+            
+def render_legends(show_region_hues: bool,
+                   selected_region_names: list[str],
+                   selected_fuels: list[str],
+                   facilities_df: pd.DataFrame,
+                   metric: str) -> None:
+    """Render a single fixed overlay with optional sections; outputs nothing else."""
+    parts = [_legend_css(), '<div class="nem-legend-wrap"><div class="nem-legend">']
+    if show_region_hues:
+        parts.append(_legend_regions_html(selected_region_names))
+    parts.append(_legend_fuels_html(facilities_df, selected_fuels))
+    label = "Power (MW)" if metric == "power_mw" else "CO₂ (t)"
+    if not facilities_df.empty and metric in facilities_df.columns:
+        parts.append(_legend_sizes_html(facilities_df[metric], label))
+    parts.append("</div></div>")
+    html = "".join(p for p in parts if p)
+    if html:
+        st.markdown(html, unsafe_allow_html=True)
+
 
 ## Helpers for Map Visualization
 
@@ -73,8 +196,9 @@ def build_region_hue_layer_from_geojson(allowed_region_names: list[str] | None =
 FUEL_TO_EMOJI_ALIAS: Dict[str, str] = {
     "Coal": ":rock:", "Black coal": ":rock:", "Brown coal": ":rock:",
     "Gas": ":fire:", "Hydro": ":droplet:", "Wind": ":dash:",
-    "Solar": ":sun_with_face:", "Battery": ":battery:",
+    "Solar": ":sun:", "Battery": ":battery:",
     "Bioenergy": ":seedling:", "Diesel": ":fuel_pump:",
+    "Pumps": ":droplet:", "Distillate": ":alembic:",
 }
 
 def emojialias_to_char(alias: str) -> str:
@@ -204,7 +328,6 @@ class MarketPayload(BaseModel):
 # MQTT Subscriber
 # -- 
 def on_connect(client, userdata: AppState, flags, rc, properties=None):
-  st.toast(f"MQTT connected (rc={rc}) | subscribing to {userdata.topic}")
   client.subscribe(userdata.topic, qos=1)
   userdata.connected = True
 
@@ -436,8 +559,6 @@ def deck_from_df(facility_df: pd.DataFrame, metric: str, show_labels: bool = Fal
                     map_style="https://basemaps.cartocdn.com/gl/positron-gl-style/style.json")
 
 
-
-
 # Side Bar
 with st.sidebar:
   st.markdown("### Connection")
@@ -463,68 +584,78 @@ st.sidebar.text(f"Facilities: {len(state.latest_by_facility)}")  # Should grow o
 # Main Area
 st.title("⚡ NEM Live Map — Power & Emissions")
 with st.container():
-
   if not state.connected:
     st.info("Not connected yet. Set broker/port/topic in the sidebar and click **Connect / Reconnect**.")
-  
+  if state.connected:
+    st.success("Connected to MQTT broker!")
   # Data Preparation
-  facility_df, market_df, region_names, fuel_types = prepare_data_from_state(state)
+facility_df, market_df, region_names, fuel_types = prepare_data_from_state(state)
   
   # Control & Metric Section
 
-  c1, c2, c3, c4 = st.columns([2, 2, 3, 3])
+c1, c2, c3, c4 = st.columns([2, 2, 3, 3])
   ## Filters
-  with c1: selected_regions: list[str] = st.multiselect("Region", options=region_names, default=region_names)
-  with c2: selected_fueltypes: list[str] = st.multiselect("Fuel", options=fuel_types, default=fuel_types)
+with c1: selected_regions: list[str] = st.multiselect("Region", options=region_names, default=region_names)
+with c2: selected_fueltypes: list[str] = st.multiselect("Fuel", options=fuel_types, default=fuel_types)
   
   ### Filtered Data
-  fdf = facility_df.copy()
-  rdf = market_df.copy()
-  if selected_fueltypes: fdf = fdf[fdf['fuel_tech'].apply(lambda ft: bool(set(selected_fueltypes) & set(ft)))]
-  if selected_regions: 
-    fdf = fdf[fdf['region'].isin(selected_regions)]
-    rdf = rdf[rdf['region_name'].isin(selected_regions)]
+fdf = facility_df.copy()
+rdf = market_df.copy()
+if selected_fueltypes: fdf = fdf[fdf['fuel_tech'].apply(lambda ft: bool(set(selected_fueltypes) & set(ft)))]
+if selected_regions: 
+  fdf = fdf[fdf['region'].isin(selected_regions)]
+  rdf = rdf[rdf['region_name'].isin(selected_regions)]
 
   ## Metrics
-  with c3:
-    st.caption("rs (filtered)")
-    m1, m2 = st.columns(2)
-    m1.metric("Total Power (MW)", f"{fdf['power_mw'].sum():,.1f}")
-    m2.metric("Total CO₂ (t)", f"{fdf['co2_tonnes'].sum():,.1f}")
+with c3:
+  st.caption("rs (filtered)")
+  m1, m2 = st.columns(2)
+  m1.metric("Total Power (MW)", f"{fdf['power_mw'].sum():,.1f}")
+  m2.metric("Total CO₂ (t)", f"{fdf['co2_tonnes'].sum():,.1f}")
 
   ## Market Data
-  with c4:
-    market_price: float = rdf['price_dmwh'].mean()
-    market_price = market_price if not pd.isna(market_price) else 0.0
-    market_demand: float = rdf['demand_mw'].sum() or 0
-    ts_label: str = rdf['timestamp'].mode()[0] if not rdf.empty else "pending data..."
+with c4:
+  market_price: float = rdf['price_dmwh'].mean()
+  market_price = market_price if not pd.isna(market_price) else 0.0
+  market_demand: float = rdf['demand_mw'].sum() or 0
+  ts_label: str = rdf['timestamp'].mode()[0] if not rdf.empty else "pending data..."
    
-    st.caption(f"NEM Market: {ts_label}")
-    m3, m4 = st.columns(2)
-    m3.metric("Average Price ($/MWh)", f"{market_price:,.1f}")
-    m4.metric("Total Demand (MW)",   f"{market_demand:,.1f}")
+  st.caption(f"NEM Market: {ts_label}")
+  m3, m4 = st.columns(2)
+  m3.metric("Average Price ($/MWh)", f"{market_price:,.1f}")
+  m4.metric("Total Demand (MW)",   f"{market_demand:,.1f}")
 
-  ### Line Plots
-  st.markdown("#### Totals over time (last 15 min)")
-  ts = totals_timeseries(state, sel_regions=selected_regions, sel_fuels=selected_fueltypes, bucket="10s", horizon_min=15)
-  if not ts.empty:
-      cts1, cts2 = st.columns(2)
-      with cts1: st.line_chart(ts.set_index("_ts")["power_mw"], height=220)
-      with cts2: st.line_chart(ts.set_index("_ts")["co2_tonnes"], height=220)
-  else:
-      st.caption("Waiting for enough data to draw totals…")
-
-  # Map Display
-  st.markdown(":earth_asia: **Live map**")
-  deck = deck_from_df(fdf, metric, show_labels=show_labels,show_region_hues =show_region_hues)
-  st.pydeck_chart(deck,width='stretch', key="deck_map")
-
+### Line Plots
+st.markdown("#### Totals over time (last 15 min)")
+ts = totals_timeseries(state, sel_regions=selected_regions, sel_fuels=selected_fueltypes, bucket="10s", horizon_min=15)
+if not ts.empty:
+    cts1, cts2 = st.columns(2)
+    with cts1: st.line_chart(ts.set_index("_ts")["power_mw"], height=220)
+    with cts2: st.line_chart(ts.set_index("_ts")["co2_tonnes"], height=220)
+else:
+    st.caption("Waiting for enough data to draw totals…")
+# Map Display
+st.markdown(":earth_asia: **Live map**")
+deck = deck_from_df(fdf, metric, show_labels=show_labels,show_region_hues =show_region_hues)
+st.pydeck_chart(deck,width='stretch')
+  # ---- init once (near top) ----
+show_legend(render_legends, show_region_hues, metric, selected_regions, selected_fueltypes, fdf)
   # DataFrame Display
-  with st.expander("Latest readings (table)", expanded=False):
-    if not fdf.empty:
-      st.dataframe(fdf, width='stretch')
-    else: 
-      st.caption("Waiting for messages…")
+# --- Latest readings (one block, two tabs) ---
+with st.expander("Latest readings", expanded=False):
+    tab_fac, tab_mkt = st.tabs(["Facilities", "Market"])
+
+    with tab_fac:
+        if not fdf.empty:
+            st.dataframe(fdf, width="stretch")
+        else:
+            st.caption("Waiting for facility messages…")
+
+    with tab_mkt:
+        if not rdf.empty:
+            st.dataframe(rdf, width="stretch")
+        else:
+            st.caption("Waiting for market messages…")
 
 if live:
   time.sleep(int(refresh_sec))
