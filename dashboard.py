@@ -4,6 +4,8 @@ import json
 import pandas as pd
 import numpy as np
 import emoji
+import constants
+
 
 from collections import deque
 from dataclasses import dataclass, field
@@ -19,6 +21,55 @@ MSG_BROKER_HOSTNAME = "test.mosquitto.org"
 MSG_BROKER_TOPIC = "comp5339/t01_group8"
 
 ## Helpers for Map Visualization
+
+def build_region_hue_layer_from_geojson(allowed_region_names: list[str] | None = None):
+    if not constants.REGION_GEOJSON:
+        return None
+
+    # turn Region multiselect (names) into allowed NEM ids using your lookup
+    st_state = get_state()
+    allowed_ids = None
+    if allowed_region_names:
+        allowed_ids = {
+            rid for rid in st_state.region_lookup.index
+            if st_state.region_lookup.loc[rid, "region_name"] in set(allowed_region_names)
+        }
+
+    # clone features and stamp colors
+    feats = []
+    for f in constants.REGION_GEOJSON.get("features", []):
+        name = (f.get("properties") or {}).get("STATE_NAME", "")
+        rid = constants.STATE_TO_REGION_ID.get(name)  # None for WA/NT/ACT
+        if not rid:
+            continue  # skip non-NEM
+        if allowed_ids and rid not in allowed_ids:
+            continue
+
+        fill = constants.REGION_COLORS.get(rid, [200, 200, 200, 70])
+        props = {**f.get("properties", {}),
+                 "region_id": rid,
+                 "region_name": st_state.region_lookup.loc[rid, "region_name"],
+                 "fill_color": fill,
+                 "line_color": [0, 0, 0, 160]}
+        feats.append({**f, "properties": props})
+
+    if not feats:
+        return None
+
+    gj = {"type": "FeatureCollection", "features": feats}
+    return pdk.Layer(
+        "GeoJsonLayer",
+        gj,
+        id="region-hues",
+        stroked=True,
+        filled=True,
+        get_fill_color="properties.fill_color",
+        get_line_color="properties.line_color",
+        line_width_min_pixels=2,
+        pickable=False,
+        opacity=0.30,
+    )
+
 FUEL_TO_EMOJI_ALIAS: Dict[str, str] = {
     "Coal": ":rock:", "Black coal": ":rock:", "Brown coal": ":rock:",
     "Gas": ":fire:", "Hydro": ":droplet:", "Wind": ":dash:",
@@ -334,7 +385,7 @@ def totals_timeseries(state: AppState, sel_regions=None, sel_fuels=None,
     return out
 
 # copied over
-def deck_from_df(facility_df: pd.DataFrame, metric: str, show_labels: bool = False) -> pdk.Deck:
+def deck_from_df(facility_df: pd.DataFrame, metric: str, show_labels: bool = False, show_region_hues: bool = False) -> pdk.Deck:
     if facility_df.empty:
         view = pdk.ViewState(latitude=-25.0, longitude=133.0, zoom=4)
         return pdk.Deck(layers=[], initial_view_state=view,
@@ -371,6 +422,10 @@ def deck_from_df(facility_df: pd.DataFrame, metric: str, show_labels: bool = Fal
                 get_alignment_baseline="'bottom'",
             )
             layers.append(labels)
+    if show_region_hues:                    
+        hue_layer = build_region_hue_layer_from_geojson(allowed_region_names=selected_regions)
+        if hue_layer:
+            layers.append(hue_layer)
 
     view = pdk.ViewState(latitude=float(data["lat"].mean()),
                          longitude=float(data["lon"].mean()), zoom=4)
@@ -392,6 +447,8 @@ with st.sidebar:
   
   connect = st.button("Connect / Reconnect", width = "stretch")
   st.markdown("---")
+  st.markdown("### Zoning")
+  show_region_hues = st.checkbox("Show region hues", value=True)
   show_labels = st.checkbox("Show marker labels", value=False)
   st.markdown("### Data & Filters")
   metric = st.radio("Bubble metric", ["power_mw", "co2_tonnes"], index=0, horizontal=True)
@@ -459,7 +516,7 @@ with st.container():
 
   # Map Display
   st.markdown(":earth_asia: **Live map**")
-  deck = deck_from_df(fdf, metric, show_labels=show_labels)
+  deck = deck_from_df(fdf, metric, show_labels=show_labels,show_region_hues =show_region_hues)
   st.pydeck_chart(deck,width='stretch', key="deck_map")
 
   # DataFrame Display
