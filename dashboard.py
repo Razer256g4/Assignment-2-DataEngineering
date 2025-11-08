@@ -758,8 +758,6 @@ ts = totals_timeseries(
     bucket="5min",
     horizon_min=60
 )
-
-# ts = totals_timeseries(state, sel_regions=selected_regions, sel_fuels=selected_fueltypes, bucket="5min", horizon_min=60)
 if not ts.empty:
     cts1, cts2 = st.columns(2)
     with cts1: st.line_chart(ts.set_index("_ts")["power_mw"], height=220)
