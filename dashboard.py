@@ -508,7 +508,18 @@ def totals_timeseries(state: AppState, sel_regions=None, sel_fuels=None,
     return out
 
 # copied over
-def deck_from_df(facility_df: pd.DataFrame, metric: str, show_labels: bool = False, show_region_hues: bool = False) -> pdk.Deck:
+def deck_from_df(
+    facility_df: pd.DataFrame,
+    metric: str,
+    show_labels: bool = False,
+    show_region_hues: bool = False,
+    allowed_region_names: Optional[list[str]] = None,
+) -> pdk.Deck:
+    """
+    Build a deck.gl map. If show_labels is True, labels display the selected metric:
+      - power_mw -> '12,345 MW'
+      - co2_tonnes -> '12,345 t CO₂'
+    """
     if facility_df.empty:
         view = pdk.ViewState(latitude=-25.0, longitude=133.0, zoom=4)
         return pdk.Deck(layers=[], initial_view_state=view,
@@ -518,6 +529,26 @@ def deck_from_df(facility_df: pd.DataFrame, metric: str, show_labels: bool = Fal
     data["icon_url"] = data["fuel_tech"].apply(get_icon_url_from_fuel)
     data["_icon_size"] = compute_marker_size(data[metric])
     data["icon_data"] = data["icon_url"].apply(lambda url: {"url": url, "width": 72, "height": 72, "anchorY": 72})
+
+    # ---- metric label text for TextLayer ----
+    def _fmt_metric(val: Any, which: str) -> str:
+        try:
+            v = float(val)
+        except Exception:
+            v = 0.0
+        if which == "power_mw":
+            return f"{v:,.1f} MW" if abs(v) < 1000 else f"{v:,.0f} MW"
+        else:
+            return f"{v:,.1f} t CO₂" if abs(v) < 1000 else f"{v:,.0f} t CO₂"
+
+    def _shorten(name: Any) -> str:
+        s = str(name or "").strip()
+        return (s[:22] + "…") if len(s) > 23 else s
+    data["label_text"] = data.apply(
+        lambda r: f"{_shorten(r.get('facility_name'))}\n{_fmt_metric(r.get(metric), metric)}",
+        axis=1,
+    )
+
 
     icon_layer = pdk.Layer(
         "IconLayer",
@@ -533,20 +564,25 @@ def deck_from_df(facility_df: pd.DataFrame, metric: str, show_labels: bool = Fal
     )
 
     layers = [icon_layer]
+
     if show_labels:
-            labels = pdk.Layer(
-                "TextLayer",
-                data=data,
-                id="labels",
-                get_position='[lon, lat]',
-                get_text="facility_name",
-                get_size=12,
-                get_color=[0, 0, 0],
-                get_alignment_baseline="'bottom'",
-            )
-            layers.append(labels)
-    if show_region_hues:                    
-        hue_layer = build_region_hue_layer_from_geojson(allowed_region_names=selected_regions)
+        labels = pdk.Layer(
+            "TextLayer",
+            data=data,
+            id="labels",
+            get_position='[lon, lat]',
+            get_text="label_text",
+            get_size=12,
+            get_color=[0, 0, 0],
+            get_alignment_baseline="'top'",     
+            get_text_anchor="'middle'",
+            get_pixel_offset='[0, -6]',    
+        )
+        layers.append(labels)
+
+
+    if show_region_hues:
+        hue_layer = build_region_hue_layer_from_geojson(allowed_region_names=allowed_region_names)
         if hue_layer:
             layers.append(hue_layer)
 
@@ -636,7 +672,14 @@ else:
     st.caption("Waiting for enough data to draw totals…")
 # Map Display
 st.markdown(":earth_asia: **Live map**")
-deck = deck_from_df(fdf, metric, show_labels=show_labels,show_region_hues =show_region_hues)
+deck = deck_from_df(
+    fdf,
+    metric,
+    show_labels=show_labels,
+    show_region_hues=show_region_hues,
+    allowed_region_names=selected_regions,
+)
+
 st.pydeck_chart(deck,width='stretch')
   # ---- init once (near top) ----
 show_legend(render_legends, show_region_hues, metric, selected_regions, selected_fueltypes, fdf)
