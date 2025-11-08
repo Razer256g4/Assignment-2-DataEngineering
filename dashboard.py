@@ -20,6 +20,15 @@ import pydeck as pdk
 MSG_BROKER_HOSTNAME = "test.mosquitto.org"
 MSG_BROKER_TOPIC = "comp5339/t01_group8"
 ## Map Legends and Helpers
+SYD_TZ = "Australia/Sydney"
+
+def parse_event_ts(ts_str: str) -> pd.Timestamp:
+    """
+    Accepts ISO 8601 strings like '2025-10-29T01:20:00+10:00' or '...Z'.
+    Returns a timezone-aware UTC timestamp.
+    """
+    ts = pd.to_datetime(ts_str, utc=True, errors="coerce")
+    return ts
 # ---- Legends (single overlay) ----
 def _legend_css() -> str:
     return """
@@ -360,25 +369,69 @@ def on_message(client, userdata: AppState, msg):
         print(f"[on_message] {fid} does not exist in facility lookup")
         return
 
+ # --- Facility Event ---
       with userdata.lock:
-        prev = userdata.latest_by_facility.get(fid, {})
-        userdata.latest_by_facility[fid] = {**prev, **validated}
-        userdata.history.append({**validated, '_ts': time.time()}) #! using transaction time is wrong
+          prev = userdata.latest_by_facility.get(fid, {})
+          userdata.latest_by_facility[fid] = {**prev, **validated}
+
+          evt_ts_utc = parse_event_ts(validated["timestamp"])  # <- use event time
+          if evt_ts_utc is pd.NaT:
+              # If the payload timestamp is bad, you can skip or fall back
+              evt_ts_utc = pd.Timestamp.utcnow().tz_localize("UTC")
+
+          userdata.history.append({
+              **validated,
+              "_event_ts": evt_ts_utc.isoformat()  # keep ISO for JSON friendliness
+          })
+
+      # --- Market Event ---
+      with userdata.lock:
+          prev = userdata.latest_by_region.get(rid, {})
+          userdata.latest_by_region[rid] = {**prev, **validated}
+
+          evt_ts_utc = parse_event_ts(validated["timestamp"])
+          if evt_ts_utc is pd.NaT:
+              evt_ts_utc = pd.Timestamp.utcnow().tz_localize("UTC")
+
+          userdata.price_demand_history.append({
+              **validated,
+              "_event_ts": evt_ts_utc.isoformat()
+          })
+
 
     # Handle Market Event
     elif "region_id" in payload:
-    #   print(f"[on_message] market event: {payload}") # debug
-      validated: dict = MarketPayload(**payload).model_dump()
-      rid = validated.pop("region_id", None)
+        validated: dict = MarketPayload(**payload).model_dump()
+        rid = validated.pop("region_id", None)
 
-      if rid in userdata.region_lookup.index:
-        row = userdata.region_lookup.loc[rid]
-        validated.setdefault("region_name", row.get("region_name"))
-        
-        with userdata.lock:
-          prev = userdata.latest_by_region.get(rid, {})
-          userdata.latest_by_region[rid] = {**prev, **validated}
-          userdata.price_demand_history.append({**validated, '_ts': time.time()}) #! using transaction time is wrong
+        if rid in userdata.region_lookup.index:
+            row = userdata.region_lookup.loc[rid]
+            validated.setdefault("region_name", row.get("region_name"))
+
+            region_code = validated.get("region")
+            try:
+                validated["region_name"] = get_state().region_lookup.loc[region_code, "region_name"]
+            except Exception:
+                validated["region_name"] = region_code  # fallback
+
+            with userdata.lock:
+                prev = userdata.latest_by_facility.get(fid, {})
+                userdata.latest_by_facility[fid] = {**prev, **validated}
+
+                evt_ts_utc = parse_event_ts(validated["timestamp"])
+                if evt_ts_utc is pd.NaT:
+                    evt_ts_utc = pd.Timestamp.utcnow().tz_localize("UTC")
+
+                userdata.history.append({**validated, "_event_ts": evt_ts_utc.isoformat()})
+
+            evt_ts_utc = parse_event_ts(validated["timestamp"])
+            if evt_ts_utc is pd.NaT:
+                evt_ts_utc = pd.Timestamp.utcnow().tz_localize("UTC")
+
+            with userdata.lock:
+                prev = userdata.latest_by_region.get(rid, {})
+                userdata.latest_by_region[rid] = {**prev, **validated}
+                userdata.price_demand_history.append({**validated, "_event_ts": evt_ts_utc.isoformat()})
 
     elif payload['timestamp'] == "starting...":
       print("[on_message] warm start event received")
@@ -471,41 +524,55 @@ def prepare_data_from_state(state: AppState):
 
 # copied over
 def totals_timeseries(state: AppState, sel_regions=None, sel_fuels=None,
-                      bucket: str = "10s", horizon_min: int = 15) -> pd.DataFrame:
+                      bucket: str = "5min", horizon_min: int = 60) -> pd.DataFrame:
+    # copy history
     with state.lock:
         hist = list(state.history)
     if not hist:
         return pd.DataFrame()
 
     h = pd.DataFrame(hist)
-    # make sure numeric
+
+    # numeric
     for c in ("power_mw", "co2_tonnes"):
         h[c] = pd.to_numeric(h.get(c), errors="coerce").fillna(0.0)
 
-    # filters (optional)
+    # event time (already stored as _event_ts in earlier patch)
+    if "_event_ts" in h.columns:
+        h["_ts"] = pd.to_datetime(h["_event_ts"], utc=True, errors="coerce")
+    else:
+        h["_ts"] = pd.to_datetime(h.get("timestamp"), utc=True, errors="coerce")
+    h = h.dropna(subset=["_ts"])
+    if h.empty:
+        return pd.DataFrame()
+
+    # optional filters
     if sel_regions:
         h = h[h.get("region").isin(sel_regions)]
     if sel_fuels:
         h["fuel_tech"] = h["fuel_tech"].apply(lambda x: x if isinstance(x, list)
                                               else ([x] if pd.notna(x) and x != "" else []))
         h = h[h["fuel_tech"].apply(lambda xs: any(x in sel_fuels for x in xs))]
-
     if h.empty:
         return pd.DataFrame()
-    
-    # time window + resample
-    tz = "Australia/Sydney"
-    h["_ts"] = pd.to_datetime(h["_ts"], unit="s", utc=True).dt.tz_convert(tz)
-    cutoff = pd.Timestamp.now(tz=tz) - pd.Timedelta(minutes=horizon_min)
+  
+    # window anchored to latest event time
+    max_ts = h["_ts"].max()
+    cutoff = max_ts - pd.Timedelta(minutes=horizon_min)
     h = h[h["_ts"] >= cutoff]
-
     if h.empty:
         return pd.DataFrame()
 
-    out = (h.set_index("_ts")[["power_mw", "co2_tonnes"]]
-             .resample(bucket).sum()
-             .reset_index())
-    return out
+
+    # snap to bucket boundary and sum per bucket
+    h["_bucket"] = h["_ts"].dt.floor(bucket)
+    out = (h.groupby("_bucket", as_index=False)[["power_mw", "co2_tonnes"]].sum()
+             .rename(columns={"_bucket": "_ts"}))
+
+    # convert to display timezone
+    out["_ts"] = out["_ts"].dt.tz_convert("Australia/Sydney")
+    return out.sort_values("_ts")
+
 
 # copied over
 def deck_from_df(
@@ -662,8 +729,8 @@ with c4:
   m4.metric("Total Demand (MW)",   f"{market_demand:,.1f}")
 
 ### Line Plots
-st.markdown("#### Totals over time (last 15 min)")
-ts = totals_timeseries(state, sel_regions=selected_regions, sel_fuels=selected_fueltypes, bucket="10s", horizon_min=15)
+st.markdown("#### Totals over time (last 1 hour)")
+ts = totals_timeseries(state, sel_regions=selected_regions, sel_fuels=selected_fueltypes, bucket="10s", horizon_min=60)
 if not ts.empty:
     cts1, cts2 = st.columns(2)
     with cts1: st.line_chart(ts.set_index("_ts")["power_mw"], height=220)
