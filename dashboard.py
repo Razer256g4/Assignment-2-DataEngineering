@@ -523,7 +523,7 @@ def prepare_data_from_state(state: AppState):
   return facility_df, market_df, region_names, fuel_types
 
 # copied over
-def totals_timeseries(state: AppState, sel_regions=None, sel_fuels=None,
+def totals_timeseries(state: AppState, sel_region_ids=None, sel_fuels=None,
                       bucket: str = "5min", horizon_min: int = 60) -> pd.DataFrame:
     # copy history
     with state.lock:
@@ -537,7 +537,7 @@ def totals_timeseries(state: AppState, sel_regions=None, sel_fuels=None,
     for c in ("power_mw", "co2_tonnes"):
         h[c] = pd.to_numeric(h.get(c), errors="coerce").fillna(0.0)
 
-    # event time (already stored as _event_ts in earlier patch)
+    # event time
     if "_event_ts" in h.columns:
         h["_ts"] = pd.to_datetime(h["_event_ts"], utc=True, errors="coerce")
     else:
@@ -546,32 +546,46 @@ def totals_timeseries(state: AppState, sel_regions=None, sel_fuels=None,
     if h.empty:
         return pd.DataFrame()
 
-    # optional filters
-    if sel_regions:
-        h = h[h.get("region").isin(sel_regions)]
+    # ---- region filter (IDs) ----
+    if sel_region_ids:
+        # history may have "region" as an ID; also accept "region_id" if present
+        candidates = []
+        if "region" in h.columns:
+            candidates.append(h["region"].isin(sel_region_ids))
+        if "region_id" in h.columns:
+            candidates.append(h["region_id"].isin(sel_region_ids))
+        if candidates:
+            mask = candidates[0]
+            for m in candidates[1:]:
+                mask = mask | m
+            h = h[mask]
+        if h.empty:
+            return pd.DataFrame()
+
+    # ---- fuel filter (unchanged) ----
     if sel_fuels:
         h["fuel_tech"] = h["fuel_tech"].apply(lambda x: x if isinstance(x, list)
                                               else ([x] if pd.notna(x) and x != "" else []))
         h = h[h["fuel_tech"].apply(lambda xs: any(x in sel_fuels for x in xs))]
-    if h.empty:
-        return pd.DataFrame()
-  
-    # window anchored to latest event time
+        if h.empty:
+            return pd.DataFrame()
+
+    # window
     max_ts = h["_ts"].max()
     cutoff = max_ts - pd.Timedelta(minutes=horizon_min)
     h = h[h["_ts"] >= cutoff]
     if h.empty:
         return pd.DataFrame()
 
-
-    # snap to bucket boundary and sum per bucket
+    # bucket + sum
     h["_bucket"] = h["_ts"].dt.floor(bucket)
     out = (h.groupby("_bucket", as_index=False)[["power_mw", "co2_tonnes"]].sum()
              .rename(columns={"_bucket": "_ts"}))
 
-    # convert to display timezone
+    # to Sydney time for display
     out["_ts"] = out["_ts"].dt.tz_convert("Australia/Sydney")
     return out.sort_values("_ts")
+
 
 
 # copied over
@@ -730,7 +744,22 @@ with c4:
 
 ### Line Plots
 st.markdown("#### Totals over time (last 1 hour)")
-ts = totals_timeseries(state, sel_regions=selected_regions, sel_fuels=selected_fueltypes, bucket="10s", horizon_min=60)
+# selected_regions are NAMES from the UI; convert to IDs for history filtering
+region_name_to_id = {state.region_lookup.loc[rid, "region_name"]: rid
+                     for rid in state.region_lookup.index}
+selected_region_ids = [region_name_to_id[n]
+                       for n in (selected_regions or [])
+                       if n in region_name_to_id]
+
+ts = totals_timeseries(
+    state,
+    sel_region_ids=selected_region_ids,
+    sel_fuels=selected_fueltypes,
+    bucket="5min",
+    horizon_min=60
+)
+
+# ts = totals_timeseries(state, sel_regions=selected_regions, sel_fuels=selected_fueltypes, bucket="5min", horizon_min=60)
 if not ts.empty:
     cts1, cts2 = st.columns(2)
     with cts1: st.line_chart(ts.set_index("_ts")["power_mw"], height=220)
