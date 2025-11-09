@@ -117,15 +117,8 @@ def _legend_sizes_html(values: pd.Series, metric_label: str) -> str:
     return f'<div class="sec"><h4>Marker size → {metric_label}</h4>{"".join(bubbles)}</div>'
 
 def show_legend(render_legends, show_region_hues, metric, selected_regions, selected_fueltypes, fdf):
-    if "show_legends" not in st.session_state:
-        st.session_state.show_legends = False
-
-  # ---- sidebar control ----
-    with st.sidebar:
-        if st.button("Legend", use_container_width=True):
-            st.session_state.show_legends = not st.session_state.show_legends
-    if st.session_state.show_legends:
-            render_legends(
+   
+    render_legends(
               show_region_hues,
               selected_regions,
               selected_fueltypes,
@@ -344,115 +337,91 @@ def on_subscribe(client, userdata, mid, reason_codes, properties):
   print(f"Subscribed successfully!")
 
 def on_message(client, userdata: AppState, msg):
-  try: 
+    try:
+        payload: dict = json.loads(msg.payload.decode("utf-8"))
 
-    payload: dict = json.loads(msg.payload.decode("utf-8"))
-    
-    # Handle Facility Event
-    if "facility_id" in payload:
-      # print(f"[on_message] facility event: {payload}") # debug
-      validated: dict = FacilityPayload(**payload).model_dump()
-      fid: str = validated.pop("facility_id", None)
-      
-      if fid not in userdata.facility_lookup.index:
-        enrich_facility_lookup(userdata, fid, payload)
+        # ----------------------------
+        # FACILITY EVENT
+        # ----------------------------
+        if "facility_id" in payload:
+            validated: dict = FacilityPayload(**payload).model_dump()
+            fid: str = validated.pop("facility_id")
 
-      try:
-        row = userdata.facility_lookup.loc[fid]
-        validated.setdefault("facility_name", row.get("facility_name"))
-        validated.setdefault("region", row.get("region"))
-        validated.setdefault("fuel_tech", row.get("fuel_tech")) # list
-        validated.setdefault("lat", float(row.get("lat")))
-        validated.setdefault("lon", float(row.get("lon")))
-      except KeyError:
-        # fid does not exist in NGER dataset as well
-        print(f"[on_message] {fid} does not exist in facility lookup")
-        return
+            # Enrich lookup if missing
+            if fid not in userdata.facility_lookup.index:
+                enrich_facility_lookup(userdata, fid, payload)
 
- # --- Facility Event ---
-      with userdata.lock:
-          prev = userdata.latest_by_facility.get(fid, {})
-          userdata.latest_by_facility[fid] = {**prev, **validated}
-
-          evt_ts_utc = parse_event_ts(validated["timestamp"])  # <- use event time
-          if evt_ts_utc is pd.NaT:
-              # If the payload timestamp is bad, you can skip or fall back
-              evt_ts_utc = pd.Timestamp.utcnow().tz_localize("UTC")
-
-          userdata.history.append({
-              **validated,
-              "_event_ts": evt_ts_utc.isoformat()  # keep ISO for JSON friendliness
-          })
-
-      # --- Market Event ---
-      with userdata.lock:
-          prev = userdata.latest_by_region.get(rid, {})
-          userdata.latest_by_region[rid] = {**prev, **validated}
-
-          evt_ts_utc = parse_event_ts(validated["timestamp"])
-          if evt_ts_utc is pd.NaT:
-              evt_ts_utc = pd.Timestamp.utcnow().tz_localize("UTC")
-
-          userdata.price_demand_history.append({
-              **validated,
-              "_event_ts": evt_ts_utc.isoformat()
-          })
-
-
-    # Handle Market Event
-    elif "region_id" in payload:
-        validated: dict = MarketPayload(**payload).model_dump()
-        rid = validated.pop("region_id", None)
-
-        if rid in userdata.region_lookup.index:
-            row = userdata.region_lookup.loc[rid]
-            validated.setdefault("region_name", row.get("region_name"))
-
-            region_code = validated.get("region")
             try:
-                validated["region_name"] = get_state().region_lookup.loc[region_code, "region_name"]
-            except Exception:
-                validated["region_name"] = region_code  # fallback
+                row = userdata.facility_lookup.loc[fid]
+                validated.setdefault("facility_name", row.get("facility_name"))
+                # keep region **ID** in state/history; map to name later for UI
+                validated.setdefault("region", row.get("region"))
+                validated.setdefault("fuel_tech", row.get("fuel_tech"))
+                validated.setdefault("lat", float(row.get("lat")))
+                validated.setdefault("lon", float(row.get("lon")))
+            except KeyError:
+                print(f"[on_message] {fid} not found in facility lookup")
+                return
+
+            evt_ts_utc = parse_event_ts(validated.get("timestamp"))
+            if evt_ts_utc is pd.NaT:
+                evt_ts_utc = pd.Timestamp.utcnow().tz_localize("UTC")
 
             with userdata.lock:
                 prev = userdata.latest_by_facility.get(fid, {})
                 userdata.latest_by_facility[fid] = {**prev, **validated}
+                userdata.history.append({
+                    **validated,
+                    "facility_id": fid,
+                    "_event_ts": evt_ts_utc.isoformat(),
+                })
+            return
 
-                evt_ts_utc = parse_event_ts(validated["timestamp"])
-                if evt_ts_utc is pd.NaT:
-                    evt_ts_utc = pd.Timestamp.utcnow().tz_localize("UTC")
+        # ----------------------------
+        # MARKET EVENT
+        # ----------------------------
+        if "region_id" in payload:
+            validated: dict = MarketPayload(**payload).model_dump()
+            rid: Optional[str] = validated.pop("region_id", None)
+            if not rid:
+                return
 
-                userdata.history.append({**validated, "_event_ts": evt_ts_utc.isoformat()})
+            # attach region_name if known
+            try:
+                validated.setdefault("region_name", userdata.region_lookup.loc[rid, "region_name"])
+            except Exception:
+                pass
 
-            evt_ts_utc = parse_event_ts(validated["timestamp"])
+            evt_ts_utc = parse_event_ts(validated.get("timestamp"))
             if evt_ts_utc is pd.NaT:
                 evt_ts_utc = pd.Timestamp.utcnow().tz_localize("UTC")
 
             with userdata.lock:
                 prev = userdata.latest_by_region.get(rid, {})
                 userdata.latest_by_region[rid] = {**prev, **validated}
-                userdata.price_demand_history.append({**validated, "_event_ts": evt_ts_utc.isoformat()})
+                userdata.price_demand_history.append({
+                    **validated,
+                    "region_id": rid,
+                    "_event_ts": evt_ts_utc.isoformat(),
+                })
+            return
 
-    elif payload['timestamp'] == "starting...":
-      print("[on_message] warm start event received")
-      pass
-    
-    return 
+        # ----------------------------
+        # WARM START / OTHER
+        # ----------------------------
+        if isinstance(payload, dict) and payload.get("timestamp") == "starting...":
+            print("[on_message] warm start event received")
+            return
 
+    except json.JSONDecodeError as e:
+        print(f"[on_message] Invalid JSON: {e}")
+    except ValidationError as e:
+        print(f"[on_message] Validation error: {e.error_count()} errors")
+        for error in e.errors():
+            print(f"  - {error['loc']}: {error['msg']}")
+    except Exception as e:
+        print(f"[on_message] Unexpected error: {e}")
 
-  except json.JSONDecodeError as e:
-    print(f"[on_message] Invalid JSON: {e}")
-    return 
-  
-  except ValidationError as e:
-    print(f"[on_message] Validation error: {e.error_count()} errors")
-    for error in e.errors():
-      print(f"  - {error['loc']}: {error['msg']}")
-    return
-  
-  except Exception as e:
-    print(f"[on_message] Unexpected error")
-    return
 
 
 # @st.cache_resource(show_spinner=False)
@@ -496,31 +465,47 @@ def start_mqtt_client(broker: str, port: int, topic: str) -> AppState:
 # region_id, region_name, timestamp, price_dmwh, demand_mw
 
 def prepare_data_from_state(state: AppState):
-  """ Prepare the data in the format ready to use for visualization """
-  if not state.latest_by_facility:
-    return (
-      pd.DataFrame(columns=["facility_id", "facility_name", "region", "timestamp", "power_mw", "co2_tonnes", "lat", "lon", "fuel_tech"]), 
-      pd.DataFrame(columns=["region_id", "region_name", "timestamp", "price_dmwh", "demand_mw"]), 
-      [], []
-    )
+    """Build facility & market frames independently; never gate one on the other."""
+    # Facilities
+    if state.latest_by_facility:
+        facility_df = (pd.DataFrame.from_dict(state.latest_by_facility, orient="index")
+                       .reset_index(names=["facility_id"]))
+        # map region IDs -> names for UI filtering
+        if "region" in facility_df.columns:
+            facility_df["region"] = facility_df["region"].apply(
+                lambda rid: state.region_lookup.loc[rid, "region_name"]
+                if (isinstance(rid, str) and rid in state.region_lookup.index) else rid
+            )
+        try:
+            fuel_types = sorted(
+                facility_df["fuel_tech"].explode().dropna().astype(str).unique().tolist()
+            )
+        except Exception:
+            fuel_types = []
+        fac_region_names = sorted(facility_df.get("region", pd.Series([], dtype=str)).unique().tolist())
+    else:
+        facility_df = pd.DataFrame(
+            columns=["facility_id","facility_name","region","timestamp",
+                     "power_mw","co2_tonnes","lat","lon","fuel_tech"]
+        )
+        fuel_types = []
+        fac_region_names = []
 
-  facility_df = pd.DataFrame.from_dict(state.latest_by_facility, orient="index").reset_index(names=['facility_id'])
-  facility_df['region'] = facility_df['region'].apply(lambda code: state.region_lookup.loc[code, 'region_name']) # so as to filter on selected region names
-  fuel_types: list = sorted(facility_df['fuel_tech'].explode().dropna().unique().tolist()) # options for fuel selector
-  region_names:list = facility_df['region'].unique().tolist()
-  
+    # Market
+    if state.latest_by_region:
+        market_df = (pd.DataFrame.from_dict(state.latest_by_region, orient="index")
+                     .reset_index(names=["region_id"]))
+        mkt_region_names = sorted(market_df.get("region_name", pd.Series([], dtype=str)).tolist())
+    else:
+        market_df = pd.DataFrame(
+            columns=["region_id","region_name","timestamp","price_dmwh","demand_mw"]
+        )
+        mkt_region_names = []
 
-  if not state.latest_by_region:
-     return (
-      facility_df, 
-      pd.DataFrame(columns=["region_id", "region_name", "timestamp", "price_dmwh", "demand_mw"]),
-      region_names, fuel_types
-     )
-  
-  market_df = pd.DataFrame.from_dict(state.latest_by_region, orient="index").reset_index(names=['region_id'])
-  region_names: list = sorted(market_df['region_name'].tolist()) # options for region selector
-  
-  return facility_df, market_df, region_names, fuel_types
+    # Region selector options: prefer market regions; fall back to facility-derived
+    region_names = mkt_region_names or fac_region_names
+
+    return facility_df, market_df, region_names, fuel_types
 
 # copied over
 def totals_timeseries(state: AppState, sel_region_ids=None, sel_fuels=None,
@@ -641,6 +626,7 @@ def deck_from_df(
         get_position='[lon, lat]',
         pickable=True,
         billboard=True,
+        autoHighlight=True,
         transitions={"get_size": 300},
     )
 
