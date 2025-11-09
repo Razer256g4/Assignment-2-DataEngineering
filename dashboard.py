@@ -655,7 +655,7 @@ def deck_from_df(
                 "{timestamp}"
             ),
             "style": {
-                "backgroundColor": "grey",
+                "backgroundColor": "white",
                 "color": "black",
                 "fontSize": "12px",
                 "padding": "6px 8px",
@@ -667,44 +667,46 @@ def deck_from_df(
 
 # Side Bar
 with st.sidebar:
+  st.markdown("## ⚙️ Settings")
   st.markdown("### Connection")
   broker = st.text_input("MQTT broker", value=MSG_BROKER_HOSTNAME)
   port = st.number_input("Port", value=1883, min_value=1, max_value=65535, step=1)
   topic = st.text_input("Topic", value=MSG_BROKER_TOPIC)
-  
   connect = st.button("Connect / Reconnect", width = "stretch")
-  st.markdown("---")
-  st.markdown("### Zoning")
+  
+  st.divider()
+
+  st.markdown("### Map Options")
   show_region_hues = st.checkbox("Show region hues", value=True)
   show_labels = st.checkbox("Show marker labels", value=False)
-  st.markdown("### Data & Filters")
   metric = st.radio("Bubble metric", ["power_mw", "co2_tonnes"], index=0, horizontal=True)
+
+  st.markdown("### Refresh Settings")
   live = st.checkbox("Live refresh", value=True)
   refresh_sec = st.slider("Refresh every (s)", min_value=1, max_value=10, value=3)
 
 # Returns new app state when restart
 state: AppState = start_mqtt_client(broker, int(port), topic) if connect else get_state()
-st.sidebar.text(f"State ID: {id(state)}")  # Should be same ID across reruns
-st.sidebar.text(f"Facilities: {len(state.latest_by_facility)}")  # Should grow over time
+
 
 # Main Area
 st.title("⚡ NEM Live Map — Power & Emissions")
-with st.container():
-  if not state.connected:
-    st.info("Not connected yet. Set broker/port/topic in the sidebar and click **Connect / Reconnect**.")
-  if state.connected:
-    st.success("Connected to MQTT broker!")
-  # Data Preparation
+if not state.connected:
+    st.warning("Not connected yet. Configure settings in the sidebar and click **Connect**.")
+if state.connected:
+    st.success("Connected to MQTT broker — Receiving live data")
+
+# Data Preparation
 facility_df, market_df, region_names, fuel_types = prepare_data_from_state(state)
   
-  # Control & Metric Section
-
+# Filters & Metric Section
 c1, c2, c3, c4 = st.columns([2, 2, 3, 3])
-  ## Filters
-with c1: selected_regions: list[str] = st.multiselect("Region", options=region_names, default=region_names)
-with c2: selected_fueltypes: list[str] = st.multiselect("Fuel", options=fuel_types, default=fuel_types)
+
+## Filters
+with c1: selected_regions: list[str] = st.multiselect("Region Filters", options=region_names, default=region_names)
+with c2: selected_fueltypes: list[str] = st.multiselect("Fuel Type Filteres", options=fuel_types, default=fuel_types)
   
-  ### Filtered Data
+### Filtered Data
 fdf = facility_df.copy()
 rdf = market_df.copy()
 if selected_fueltypes: fdf = fdf[fdf['fuel_tech'].apply(lambda ft: bool(set(selected_fueltypes) & set(ft)))]
@@ -712,27 +714,41 @@ if selected_regions:
   fdf = fdf[fdf['region'].isin(selected_regions)]
   rdf = rdf[rdf['region_name'].isin(selected_regions)]
 
-  ## Metrics
-with c3:
-  st.caption("rs (filtered)")
-  m1, m2 = st.columns(2)
-  m1.metric("Total Power (MW)", f"{fdf['power_mw'].sum():,.1f}")
-  m2.metric("Total CO₂ (t)", f"{fdf['co2_tonnes'].sum():,.1f}")
+### Filtered Data - Market
+gen_power: float = fdf['power_mw'].sum()
+gen_emission: float = fdf['co2_tonnes'].sum()
+gen_ts: str = (
+    pd.to_datetime(fdf['timestamp'].mode()[0]).strftime("%d %b %Y %I:%M %p")
+    if not fdf.empty 
+    else "pending ..."
+)
 
-  ## Market Data
+### Filtered Data - Market
+market_price: float = rdf['price_dmwh'].mean()
+market_price = market_price if not pd.isna(market_price) else 0.0
+market_demand: float = rdf['demand_mw'].sum() or 0
+market_ts: str = (
+    pd.to_datetime(rdf['timestamp'].mode()[0]).strftime("%d %b %Y %I:%M %p")
+    if not rdf.empty 
+    else "pending..."
+)
+
+with c3:
+  st.markdown("Generation Data")
+  m1, m2 = st.columns(2)
+  m1.metric("Total Power", f"{gen_power:,.0f} MW")
+  m2.metric("Total CO₂ Emission", f"{gen_emission:,.0f} t" )
+  st.caption(f"Last updated: {gen_ts}")
+
 with c4:
-  market_price: float = rdf['price_dmwh'].mean()
-  market_price = market_price if not pd.isna(market_price) else 0.0
-  market_demand: float = rdf['demand_mw'].sum() or 0
-  ts_label: str = rdf['timestamp'].mode()[0] if not rdf.empty else "pending data..."
-   
-  st.caption(f"NEM Market: {ts_label}")
+  st.markdown(f"Market Data")
   m3, m4 = st.columns(2)
-  m3.metric("Average Price ($/MWh)", f"{market_price:,.1f}")
-  m4.metric("Total Demand (MW)",   f"{market_demand:,.1f}")
+  m3.metric("Average Price", f"{market_price:,.0f} $/MWh")
+  m4.metric("Total Demand",   f"{market_demand:,.0f} MW")
+  st.caption(f"Last updated: {market_ts}")
 
 ### Line Plots
-st.markdown("#### Totals over time (last 1 hour)")
+st.markdown("##### Generation Trends (Last Hour)")
 
 # selected_regions are NAMES from the UI; convert to IDs for history filtering
 region_name_to_id = {state.region_lookup.loc[rid, "region_name"]: rid
@@ -764,46 +780,43 @@ if not ts.empty:
     cts1, cts2 = st.columns(2)
 
     with cts1:
-        p_power = (
-            alt.Chart(ts_plot)
-            .mark_line()
-            .encode(
-                x=x_enc,
-                y=alt.Y("power_mw:Q", title="Power (MW)"),
-                tooltip=[
-                    alt.Tooltip("TimeLabel:N", title="Time"),
-                    alt.Tooltip("power_mw:Q", title="Power (MW)", format=",.1f"),
-                ],
-                order=alt.Order("EventTime:T")  # ensure lines follow true time order
-            )
-            .properties(height=220)
-            .interactive()
+        st.markdown("**Power Output (MW)**")
+        p_base = alt.Chart(ts_plot).encode(
+            x=x_enc,
+            y=alt.Y("power_mw:Q", title="megawatts"),
+            tooltip=[
+                alt.Tooltip("TimeLabel:N", title="Time"),
+                alt.Tooltip("power_mw:Q", title="Power (MW)", format=",.1f"),
+            ],
+            order=alt.Order("EventTime:T")  # ensure lines follow true time order
         )
+
+        line = p_base.mark_line()
+        points = p_base.mark_point(size=80, filled=True, opacity=1)
+        p_power = (line + points).properties(height=220).interactive()
         st.altair_chart(p_power, width='stretch')
 
     with cts2:
-        p_co2 = (
-            alt.Chart(ts_plot)
-            .mark_line()
-            .encode(
-                x=x_enc,
-                y=alt.Y("co2_tonnes:Q", title="CO₂ (t)"),
-                tooltip=[
-                    alt.Tooltip("TimeLabel:N", title="Time"),
-                    alt.Tooltip("co2_tonnes:Q", title="CO₂ (t)", format=",.1f"),
-                ],
-                order=alt.Order("EventTime:T")
-            )
-            .properties(height=220)
-            .interactive()
+        st.markdown("**CO₂ Emissions (t)**")
+        co2_base = alt.Chart(ts_plot).encode(
+            x=x_enc,
+            y=alt.Y("co2_tonnes:Q", title="tonnes"),
+            tooltip=[
+                alt.Tooltip("TimeLabel:N", title="Time"),
+                alt.Tooltip("co2_tonnes:Q", title="CO₂ (t)", format=",.1f"),
+            ],
+            order=alt.Order("EventTime:T")
         )
+        co2_line = co2_base.mark_line()
+        co2_points = co2_base.mark_point(size=80, filled=True, opacity=1)
+        p_co2 = (co2_line + co2_points).properties(height=220).interactive()
         st.altair_chart(p_co2, width='stretch')
 else:
-    st.caption("Waiting for enough data to draw totals…")
+    st.info("⏳ Accumulating data for charts...")
 
 
 # Map Display
-st.markdown(":earth_asia: **Live map**")
+
 deck = deck_from_df(
     fdf,
     metric,
@@ -811,13 +824,16 @@ deck = deck_from_df(
     show_region_hues=show_region_hues,
     allowed_region_names=selected_regions,
 )
-
+st.markdown("##### 🌏 Live Facility Map")
+st.caption(f"Last updated: {gen_ts}")
 st.pydeck_chart(deck,width='stretch')
-  # ---- init once (near top) ----
+
+# ---- init once (near top) ----
 show_legend(render_legends, show_region_hues, metric, selected_regions, selected_fueltypes, fdf)
-  # DataFrame Display
+
+# DataFrame Display
 # --- Latest readings (one block, two tabs) ---
-with st.expander("Latest readings", expanded=False):
+with st.expander("Latest readings", expanded=True):
     tab_fac, tab_mkt = st.tabs(["Facilities", "Market"])
 
     with tab_fac:
