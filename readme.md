@@ -32,6 +32,8 @@
 
 # Run
 ```
+python version 3.12.12
+
 cd Assignment-2-DataEngineering
 # activate python env with vene or conda
 
@@ -44,3 +46,4 @@ streamlit run dashboard.py
 # From new terminal, start Publishing from Cache file
 python publisher.py
 ```
+
