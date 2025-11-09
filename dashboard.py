@@ -5,6 +5,7 @@ import pandas as pd
 import numpy as np
 import emoji
 import constants
+import altair as alt
 
 
 from collections import deque
@@ -23,12 +24,7 @@ MSG_BROKER_TOPIC = "comp5339/t01_group8"
 SYD_TZ = "Australia/Sydney"
 
 def parse_event_ts(ts_str: str) -> pd.Timestamp:
-    """
-    Accepts ISO 8601 strings like '2025-10-29T01:20:00+10:00' or '...Z'.
-    Returns a timezone-aware UTC timestamp.
-    """
-    ts = pd.to_datetime(ts_str, utc=True, errors="coerce")
-    return ts
+    return pd.to_datetime(ts_str, errors="coerce") 
 # ---- Legends (single overlay) ----
 def _legend_css() -> str:
     return """
@@ -363,9 +359,7 @@ def on_message(client, userdata: AppState, msg):
                 print(f"[on_message] {fid} not found in facility lookup")
                 return
 
-            evt_ts_utc = parse_event_ts(validated.get("timestamp"))
-            if evt_ts_utc is pd.NaT:
-                evt_ts_utc = pd.Timestamp.utcnow().tz_localize("UTC")
+            evt_ts = parse_event_ts(validated.get("timestamp"))
 
             with userdata.lock:
                 prev = userdata.latest_by_facility.get(fid, {})
@@ -373,7 +367,7 @@ def on_message(client, userdata: AppState, msg):
                 userdata.history.append({
                     **validated,
                     "facility_id": fid,
-                    "_event_ts": evt_ts_utc.isoformat(),
+                    "_event_ts": evt_ts,
                 })
             return
 
@@ -392,17 +386,15 @@ def on_message(client, userdata: AppState, msg):
             except Exception:
                 pass
 
-            evt_ts_utc = parse_event_ts(validated.get("timestamp"))
-            if evt_ts_utc is pd.NaT:
-                evt_ts_utc = pd.Timestamp.utcnow().tz_localize("UTC")
-
+            evt_ts= parse_event_ts(validated.get("timestamp"))
+            
             with userdata.lock:
                 prev = userdata.latest_by_region.get(rid, {})
                 userdata.latest_by_region[rid] = {**prev, **validated}
                 userdata.price_demand_history.append({
                     **validated,
                     "region_id": rid,
-                    "_event_ts": evt_ts_utc.isoformat(),
+                    "_event_ts": evt_ts,
                 })
             return
 
@@ -507,10 +499,8 @@ def prepare_data_from_state(state: AppState):
 
     return facility_df, market_df, region_names, fuel_types
 
-# copied over
 def totals_timeseries(state: AppState, sel_region_ids=None, sel_fuels=None,
                       bucket: str = "5min", horizon_min: int = 60) -> pd.DataFrame:
-    # copy history
     with state.lock:
         hist = list(state.history)
     if not hist:
@@ -522,32 +512,32 @@ def totals_timeseries(state: AppState, sel_region_ids=None, sel_fuels=None,
     for c in ("power_mw", "co2_tonnes"):
         h[c] = pd.to_numeric(h.get(c), errors="coerce").fillna(0.0)
 
-    # event time
-    if "_event_ts" in h.columns:
-        h["_ts"] = pd.to_datetime(h["_event_ts"], utc=True, errors="coerce")
+    # event time (use parsed _ts if present; otherwise parse the raw string)
+    if "_ts" in h.columns:
+        h["_ts"] = pd.to_datetime(h["_ts"], errors="coerce")
     else:
-        h["_ts"] = pd.to_datetime(h.get("timestamp"), utc=True, errors="coerce")
+        h["_ts"] = pd.to_datetime(h.get("_event_ts_raw") or h.get("timestamp"), errors="coerce")
+
     h = h.dropna(subset=["_ts"])
     if h.empty:
         return pd.DataFrame()
 
-    # ---- region filter (IDs) ----
+    # ---- region filter by IDs (history retains IDs) ----
     if sel_region_ids:
-        # history may have "region" as an ID; also accept "region_id" if present
-        candidates = []
+        masks = []
         if "region" in h.columns:
-            candidates.append(h["region"].isin(sel_region_ids))
+            masks.append(h["region"].isin(sel_region_ids))
         if "region_id" in h.columns:
-            candidates.append(h["region_id"].isin(sel_region_ids))
-        if candidates:
-            mask = candidates[0]
-            for m in candidates[1:]:
-                mask = mask | m
-            h = h[mask]
-        if h.empty:
-            return pd.DataFrame()
+            masks.append(h["region_id"].isin(sel_region_ids))
+        if masks:
+            m = masks[0]
+            for mm in masks[1:]:
+                m = m | mm
+            h = h[m]
+            if h.empty:
+                return pd.DataFrame()
 
-    # ---- fuel filter (unchanged) ----
+    # ---- fuel filter ----
     if sel_fuels:
         h["fuel_tech"] = h["fuel_tech"].apply(lambda x: x if isinstance(x, list)
                                               else ([x] if pd.notna(x) and x != "" else []))
@@ -562,13 +552,14 @@ def totals_timeseries(state: AppState, sel_region_ids=None, sel_fuels=None,
     if h.empty:
         return pd.DataFrame()
 
-    # bucket + sum
+    # bucket + sum (works fine on tz-aware with original offsets)
     h["_bucket"] = h["_ts"].dt.floor(bucket)
     out = (h.groupby("_bucket", as_index=False)[["power_mw", "co2_tonnes"]].sum()
              .rename(columns={"_bucket": "_ts"}))
 
-    # to Sydney time for display
-    out["_ts"] = out["_ts"].dt.tz_convert("Australia/Sydney")
+    # Build a stable text label that reflects the *received* offset (24h)
+    out["TimeLabel"] = out["_ts"].dt.strftime("%Y-%m-%d %H:%M")
+
     return out.sort_values("_ts")
 
 
@@ -655,9 +646,21 @@ def deck_from_df(
 
     view = pdk.ViewState(latitude=float(data["lat"].mean()),
                          longitude=float(data["lon"].mean()), zoom=4)
-    tooltip = {"text": "{facility_name}\n{region} • {fuel_tech}\n"
-                       f"{'Power' if metric=='power_mw' else 'CO₂'}: {{{metric}}}\n"
-                       "{timestamp}"}
+    tooltip = {
+            "html": (
+                "<b>{facility_name}</b><br/>"
+                "{region} • {fuel_tech}<br/>"
+                "Power: {power_mw} MW<br/>"
+                "CO₂: {co2_tonnes} t<br/>"
+                "{timestamp}"
+            ),
+            "style": {
+                "backgroundColor": "grey",
+                "color": "black",
+                "fontSize": "12px",
+                "padding": "6px 8px",
+            },
+        }
     return pdk.Deck(layers=layers, initial_view_state=view, tooltip=tooltip,
                     map_style="https://basemaps.cartocdn.com/gl/positron-gl-style/style.json")
 
@@ -730,6 +733,7 @@ with c4:
 
 ### Line Plots
 st.markdown("#### Totals over time (last 1 hour)")
+
 # selected_regions are NAMES from the UI; convert to IDs for history filtering
 region_name_to_id = {state.region_lookup.loc[rid, "region_name"]: rid
                      for rid in state.region_lookup.index}
@@ -744,12 +748,60 @@ ts = totals_timeseries(
     bucket="5min",
     horizon_min=60
 )
+
 if not ts.empty:
+    ts_plot = ts.rename(columns={"_ts": "EventTime"})
+
+    # Use the fixed label (24h) on x; keep order as-is.
+    x_enc = alt.X(
+    "TimeLabel:N",
+    title="Time",
+    sort=None,
+    axis=alt.Axis(labelAngle=0, labelOverlap=True, labelPadding=4)
+)
+
+
     cts1, cts2 = st.columns(2)
-    with cts1: st.line_chart(ts.set_index("_ts")["power_mw"], height=220)
-    with cts2: st.line_chart(ts.set_index("_ts")["co2_tonnes"], height=220)
+
+    with cts1:
+        p_power = (
+            alt.Chart(ts_plot)
+            .mark_line()
+            .encode(
+                x=x_enc,
+                y=alt.Y("power_mw:Q", title="Power (MW)"),
+                tooltip=[
+                    alt.Tooltip("TimeLabel:N", title="Time"),
+                    alt.Tooltip("power_mw:Q", title="Power (MW)", format=",.1f"),
+                ],
+                order=alt.Order("EventTime:T")  # ensure lines follow true time order
+            )
+            .properties(height=220)
+            .interactive()
+        )
+        st.altair_chart(p_power, width='stretch')
+
+    with cts2:
+        p_co2 = (
+            alt.Chart(ts_plot)
+            .mark_line()
+            .encode(
+                x=x_enc,
+                y=alt.Y("co2_tonnes:Q", title="CO₂ (t)"),
+                tooltip=[
+                    alt.Tooltip("TimeLabel:N", title="Time"),
+                    alt.Tooltip("co2_tonnes:Q", title="CO₂ (t)", format=",.1f"),
+                ],
+                order=alt.Order("EventTime:T")
+            )
+            .properties(height=220)
+            .interactive()
+        )
+        st.altair_chart(p_co2, width='stretch')
 else:
     st.caption("Waiting for enough data to draw totals…")
+
+
 # Map Display
 st.markdown(":earth_asia: **Live map**")
 deck = deck_from_df(
