@@ -142,7 +142,6 @@ def render_legends(show_region_hues: bool,
 
 
 ## Helpers for Map Visualization
-
 def build_region_hue_layer_from_geojson(allowed_region_names: list[str] | None = None):
     if not constants.REGION_GEOJSON:
         return None
@@ -416,7 +415,6 @@ def on_message(client, userdata: AppState, msg):
 
 
 
-# @st.cache_resource(show_spinner=False)
 def start_mqtt_client(broker: str, port: int, topic: str) -> AppState:
   state = get_state()
   state.topic = topic
@@ -679,7 +677,7 @@ with st.sidebar:
   st.markdown("### Map Options")
   show_region_hues = st.checkbox("Show region hues", value=True)
   show_labels = st.checkbox("Show marker labels", value=False)
-  metric = st.radio("Bubble metric", ["power_mw", "co2_tonnes"], index=0, horizontal=True)
+  metric = st.radio("Marker Metric", ["power_mw", "co2_tonnes"], index=0, horizontal=True)
 
   st.markdown("### Refresh Settings")
   live = st.checkbox("Live refresh", value=True)
